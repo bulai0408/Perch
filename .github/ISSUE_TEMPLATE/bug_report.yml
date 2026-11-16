@@ -1,0 +1,66 @@
+name: Bug report / 问题反馈
+description: Something in Perch doesn't work as expected. / Perch 有地方不对。
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Do not paste real gateway keys (`sk-magpie-…`), addresses, emails or screenshots of real accounts.** Use placeholders, or blur them.
+        Security issues: please report privately, see SECURITY.md.
+        感谢反馈！**不要贴真实的密钥、地址、邮箱或真实账号的截图**，请打码或用占位符。安全问题请按 SECURITY.md 私下报告。
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened / 发生了什么
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      placeholder: |
+        1. 打开 …
+        2. 点 …
+        3. 看到 …
+    validations:
+      required: true
+  - type: input
+    id: perch
+    attributes:
+      label: Perch version or commit / Perch 版本或 commit
+      description: 设置 → 关于, or `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: input
+    id: magpie
+    attributes:
+      label: magpie version / magpie 版本
+      description: Shown in 设置 (magpie 0.1.4283+), or `magpie --version`.
+    validations:
+      required: true
+  - type: input
+    id: ios
+    attributes:
+      label: iOS version and device / iOS 版本和设备
+      placeholder: iOS 26.1, iPhone 17 (or Simulator)
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area / 涉及页面
+      multiple: true
+      options:
+        - 连接 / Connect
+        - 额度 / Quotas
+        - Agent
+        - 路由组 / Routing groups
+        - 设置 / Settings
+        - Build / signing
+        - Other
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots, logs, anything else / 截图、日志等
+      description: Remove keys, addresses and personal data first. Demo-data (`-perch-demo`) screenshots are welcome.

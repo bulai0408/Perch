@@ -1,0 +1,27 @@
+name: Feature request / 功能建议
+description: Suggest an idea for Perch. / 给 Perch 提个想法。
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / 想解决什么问题
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposed solution / 你的想法
+      description: How should it work in Perch? Sketches welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives / 其他方案
+  - type: input
+    id: magpie
+    attributes:
+      label: magpie dependency / 是否依赖 magpie 的新接口
+      description: Does it need something magpie doesn't expose yet? Which version or endpoint?

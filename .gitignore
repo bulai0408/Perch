@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.xcarchive
+*.xcresult
+timeline.xctimeline
+playground.xcworkspace
+.swiftpm/
+.build/
+
+# Personal signing settings (copy Config/Local.example.xcconfig)
+Config/Local.xcconfig
+
+# Local tooling state, never published
+.airbuild/

@@ -1,0 +1,14 @@
+// Shared build settings for every target. Committed; holds no personal values.
+//
+// Your own signing team and bundle id go in Config/Local.xcconfig, which is
+// gitignored. Copy Config/Local.example.xcconfig to Config/Local.xcconfig and
+// fill it in. Without it the project still builds for the Simulator, using
+// the placeholder bundle id below.
+
+// The app's bundle id. The test targets append `.tests` and `.uitests`.
+PERCH_BUNDLE_ID = com.example.perch
+
+// Your Apple Developer team id (10 characters). Empty: Simulator-only builds.
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

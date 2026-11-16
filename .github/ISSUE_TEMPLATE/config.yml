@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability / 报告安全漏洞
+    url: https://github.com/bulai0408/Perch/security/advisories/new
+    about: Please report security issues privately, not in public issues.
+  - name: magpie itself / magpie 本身的问题
+    url: https://github.com/yetone/magpie/issues
+    about: Problems with the magpie gateway belong in the magpie project.

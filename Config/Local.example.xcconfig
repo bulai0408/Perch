@@ -1,0 +1,13 @@
+// Copy this file to Config/Local.xcconfig (gitignored) and fill it in to
+// build Perch to your own iPhone:
+//
+//   cp Config/Local.example.xcconfig Config/Local.xcconfig
+//
+// Never commit Config/Local.xcconfig.
+
+// A bundle id you own, e.g. a reverse-DNS name under your domain.
+PERCH_BUNDLE_ID = com.yourname.perch
+
+// Your team id: Xcode → Settings → Accounts, or developer.apple.com →
+// Membership details. A free Personal Team works for running on your device.
+DEVELOPMENT_TEAM = YOURTEAMID
