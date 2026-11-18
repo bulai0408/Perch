@@ -198,6 +198,28 @@ struct MultiComputerTests {
         #expect(again.computers.map(\.id) == [c.id])
     }
 
+    @Test func savedV1AddressesLoseTheirV1() throws {
+        let d = defaults()
+        let secrets = MemorySecrets()
+        let saved = [
+            Computer(id: "a", name: "office-mac", address: URL(string: "http://192.168.1.20:3425/v1")!, lastConnected: nil),
+            Computer(id: "b", name: "box", address: URL(string: "https://box.example/magpie/v1/")!, lastConnected: nil),
+            Computer(id: "c", name: "home", address: URL(string: "http://home.local:3425")!, lastConnected: nil),
+        ]
+        d.set(try JSONEncoder().encode(saved), forKey: ConnectionStore.computersKey)
+        secrets.items[ConnectionStore.keyAccount("a")] = "k"
+        let store = ConnectionStore(defaults: d, secrets: secrets)
+        #expect(store.computers.map(\.address.absoluteString)
+                == ["http://192.168.1.20:3425", "https://box.example/magpie", "http://home.local:3425"])
+        #expect(store.currentID == "a")
+        #expect(store.gatewayKey() == "k")
+        // Written back, so the next launch reads the fixed address.
+        let again = ConnectionStore(defaults: d, secrets: secrets)
+        #expect(again.computers.first?.address.absoluteString == "http://192.168.1.20:3425")
+        #expect(MagpieAddress.droppingV1(URL(string: "http://office-mac:3425/v10")!).absoluteString == "http://office-mac:3425/v10")
+        #expect(MagpieAddress.droppingV1(URL(string: "http://office-mac:3425/")!).absoluteString == "http://office-mac:3425/")
+    }
+
     @Test func addSelectRemove() throws {
         let secrets = MemorySecrets()
         let store = ConnectionStore(defaults: defaults(), secrets: secrets)

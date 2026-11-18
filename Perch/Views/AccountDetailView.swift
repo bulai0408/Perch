@@ -16,6 +16,7 @@ struct AccountDetailView: View {
     @State private var toast: String?
     @State private var confirmOff = false
     @State private var failure: MagpieAPIError?
+    @State private var pull = PullOutcome()
 
     var body: some View {
         Group {
@@ -28,6 +29,8 @@ struct AccountDetailView: View {
             }
         }
         .navigationBarTitleDisplayMode(.inline)
+        .statusCapsule(computer: connection.computerName ?? "", freshness: store.freshness)
+        .pullFeedback(pull)
         .toast($toast, seconds: 2)
         .task { await store.loadHistory(connection.magpieClient()) }
     }
@@ -43,6 +46,19 @@ struct AccountDetailView: View {
         let justUsed = store.justUsed.contains(account.id)
         let runOut = account.off || account.card.error?.trimmed.isEmpty == false ? nil : store.runOut(account.card, now: now)
         List {
+            if store.isOffline {
+                Section {
+                    OfflineCard(computer: connection.computerName ?? "", since: store.lastRead, now: now) {
+                        Task { await reload() }
+                    }
+                }
+                .bannerRow()
+            } else if store.isStale, let since = store.lastRead {
+                Section {
+                    StaleBanner(since: since, now: now) { Task { await reload() } }
+                }
+                .bannerRow()
+            }
             if account.card.loginExpired {
                 Section {
                     Label {
@@ -92,16 +108,21 @@ struct AccountDetailView: View {
         }
         .listSectionSpacing(18)
         .refreshable {
-            now = .now
-            await store.load(connection.quotaClient(), extras: connection.magpieClient())
-            await store.loadHistory(connection.magpieClient())
+            await reload()
+            pull.record(store.freshness.failure == nil && store.phase == .loaded)
         }
+        .environment(\.fromCache, store.fromCache)
         .alert(Text("停用 \(account.title)？"), isPresented: $confirmOff) {
             Button("停用", role: .destructive) { Task { await set(account, on: false) } }
             Button("取消", role: .cancel) {}
         } message: {
             Text(verbatim: offMessage(account))
         }
+    }
+
+    private func reload() async {
+        now = .now
+        await store.load(connection.quotaClient(), extras: connection.magpieClient(), computer: connection.currentID)
     }
 
     /// The confirmation text for switching the account off, warning when it's

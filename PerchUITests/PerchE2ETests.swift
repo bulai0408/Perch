@@ -24,6 +24,11 @@ final class PerchE2ETests: XCTestCase {
         /// 1.4: e2e.sh made Claude Code calls that failed (429), that magpie
         /// handed on (500 → alpha), and keeps one slow call running.
         var agentCalls: Bool? = nil
+        /// A group e2e.sh switched off (`retired`), and those it deleted:
+        /// one of the user's, gone from magpie's list, and a found one
+        /// magpie keeps with `"hidden": true`.
+        var disabledGroup: String? = nil
+        var deletedGroups: [String]? = nil
     }
 
     private var config: Config!
@@ -223,13 +228,20 @@ final class PerchE2ETests: XCTestCase {
         XCTAssertTrue(cards(app).firstMatch.label.hasPrefix("个人号"), cards(app).firstMatch.label)
 
         let card = cards(app).firstMatch
-        card.press(forDuration: 1.2)
         let refresh = app.buttons["刷新这张额度"].firstMatch
-        XCTAssertTrue(refresh.waitForExistence(timeout: 5), "no 刷新这张额度 on long-press")
+        // A long-press right after the re-sort animation can be dropped: retry.
+        func openMenu() {
+            for _ in 0..<3 {
+                sleep(1)
+                card.press(forDuration: 1.2)
+                if refresh.waitForExistence(timeout: 4) { return }
+            }
+            XCTFail("no 刷新这张额度 on long-press")
+        }
+        openMenu()
         refresh.tap()
         sleep(1)
-        card.press(forDuration: 1.2)
-        XCTAssertTrue(refresh.waitForExistence(timeout: 5))
+        openMenu()
         refresh.tap()
         expectToast(app, "刚刷新过", "20c-quotas-cooldown")
 
@@ -244,13 +256,25 @@ final class PerchE2ETests: XCTestCase {
 
     /// Taps a sort-menu item once the menu has finished animating in, then
     /// waits for the sort control to report the new order.
+    /// The simulator sometimes drops a tap on a menu item that is still
+    /// settling (the menu stays or closes, the choice doesn't take), so a
+    /// missed pick reopens the menu and tries again, up to three times.
     private func pickSort(_ app: XCUIApplication, _ item: XCUIElement, expect: String) {
-        let hittable = expectation(for: NSPredicate(format: "isHittable == true"), evaluatedWith: item)
-        wait(for: [hittable], timeout: 5)
-        usleep(400_000)
-        item.tap()
-        let sorted = expectation(for: NSPredicate(format: "value == %@", expect), evaluatedWith: any(app, "quota-sort"))
-        wait(for: [sorted], timeout: 5)
+        let control = any(app, "quota-sort")
+        let isSorted = NSPredicate(format: "value == %@", expect)
+        for attempt in 1...3 {
+            if attempt > 1 {
+                if !item.exists { control.tap() }
+                _ = item.waitForExistence(timeout: 5)
+            }
+            let hittable = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isHittable == true"), object: item)
+            _ = XCTWaiter.wait(for: [hittable], timeout: 5)
+            usleep(400_000)
+            item.tap()
+            let sorted = XCTNSPredicateExpectation(predicate: isSorted, object: control)
+            if XCTWaiter.wait(for: [sorted], timeout: 5) == .completed { return }
+        }
+        XCTFail("sort: \(expect) didn't take after 3 picks; value is \(control.value ?? "nil")")
     }
 
     /// 1.3 screens on demo data: account detail, the Agent tab and its
@@ -382,6 +406,62 @@ final class PerchE2ETests: XCTestCase {
         shot(odd, "32-history-unrecognized")
     }
 
+    /// Demo data: the Agent empty state, 设为首选 moving the
+    /// row to the top with the 首选 chip, and 设置 关于 with the credit.
+    func test0e_v15Stage2AgentRoutingAbout() throws {
+        let empty = launchDemo(["PERCH_DEMO_STATE": "empty"])
+        XCTAssertTrue(empty.navigationBars["额度"].waitForExistence(timeout: 20))
+        openTab(empty, "Agent", ready: any(empty, "agent-period"))
+        XCTAssertTrue(any(empty, "agent-empty").waitForExistence(timeout: 10), "no Agent empty state")
+        XCTAssertTrue(empty.staticTexts["还没有 Agent 来过"].exists, "no 还没有 Agent 来过")
+        XCTAssertFalse(any(empty, "agent-live").exists, "正在进行 with no calls")
+        shot(empty, "50-agent-empty")
+        empty.terminate()
+
+        let app = launchDemo()
+        XCTAssertTrue(app.navigationBars["额度"].waitForExistence(timeout: 20))
+        openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+        XCTAssertTrue(any(app, "agent-tile-calls").waitForExistence(timeout: 10))
+        XCTAssertTrue(any(app, "period-today").isSelected, "今天 is not the default")
+        any(app, "period-7d").tap()
+        XCTAssertTrue(any(app, "period-7d").isSelected, "7 天 not selected")
+        XCTAssertTrue(any(app, "agent-summary").waitForExistence(timeout: 10))
+        XCTAssertTrue(any(app, "agent-summary").label.hasPrefix("这 7 天"), any(app, "agent-summary").label)
+        shot(app, "51-agent-7d")
+        any(app, "period-today").tap()
+
+        // 设为首选 (demo: the group changes in place): gamma moves to the top.
+        openTab(app, "路由组")
+        let coder = app.buttons["group-coder"]
+        XCTAssertTrue(coder.waitForExistence(timeout: 10))
+        coder.tap()
+        waitForGroup(app, "Coder")
+        let alpha = any(app, "member-alpha/m-alpha")
+        let gamma = any(app, "member-gamma/m-gamma")
+        XCTAssertTrue(alpha.waitForExistence(timeout: 10) && gamma.exists)
+        XCTAssertTrue(alpha.label.contains("首选"), alpha.label)
+        XCTAssertLessThan(alpha.frame.minY, gamma.frame.minY)
+        makePrimary(app, "gamma/m-gamma")
+        expectToast(app, "已把 m-gamma 设为首选", "52-primary-demo")
+        XCTAssertTrue(any(app, "member-gamma/m-gamma").label.contains("首选"), any(app, "member-gamma/m-gamma").label)
+        XCTAssertFalse(any(app, "member-alpha/m-alpha").label.contains("首选"))
+        XCTAssertLessThan(any(app, "member-gamma/m-gamma").frame.minY, any(app, "member-alpha/m-alpha").frame.minY,
+                          "设为首选 did not move the row to the top")
+
+        // 设置 → 关于: icon, Perch, the one-liner, the note, Made with AirBuild.
+        openTab(app, "设置")
+        let about = any(app, "about-header")
+        for _ in 0..<6 where !(about.exists && about.isHittable) { app.swipeUp() }
+        XCTAssertTrue(about.exists, "no 关于 header")
+        XCTAssertTrue(about.label.contains("Perch") && about.label.contains("额度一眼看清，模型随手调。"), about.label)
+        app.swipeUp()
+        XCTAssertTrue(app.staticTexts["Perch 是 magpie 的手机遥控器，和 magpie 官方无关。"].waitForExistence(timeout: 5)
+                      || any(app, "about-note").exists, "no 关于 note")
+        let credit = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", "AirBuild")).firstMatch
+        XCTAssertTrue(credit.waitForExistence(timeout: 5), "no Made with AirBuild")
+        shot(app, "53-settings-about")
+    }
+
     /// 1.4 on demo data: run-out, 登录已失效, the version banner and notes,
     /// the Agent summary, 正在进行, cost bars, failures in words, the call
     /// list chips, 「magpie 原话」, two computers and 「magpie 版本」.
@@ -452,7 +532,9 @@ final class PerchE2ETests: XCTestCase {
         shot(app, "34-agent-v14")
 
         // 30 天: 每天的费用, tap a bar for the callout.
-        app.segmentedControls["agent-period"].buttons["30 天"].tap()
+        // 1.5: a custom segmented control (track + sliding card).
+        any(app, "period-30d").tap()
+        XCTAssertTrue(any(app, "period-30d").isSelected, "30 天 not selected")
         XCTAssertTrue(app.staticTexts["每天的费用"].waitForExistence(timeout: 10), "no 每天的费用")
         XCTAssertTrue(summary.waitForExistence(timeout: 10))
         XCTAssertTrue(any(app, "agent-summary").label.hasPrefix("这 30 天 Claude Code 调用"), any(app, "agent-summary").label)
@@ -464,7 +546,7 @@ final class PerchE2ETests: XCTestCase {
             XCTAssertTrue(callout.label.contains("约 $"), callout.label)
         }
         shot(app, "35-agent-30d")
-        app.segmentedControls["agent-period"].buttons["今天"].tap()
+        any(app, "period-today").tap()
 
         // 「失败 N 次。」 → 最近的调用 on 只看失败, rows in words.
         let failures = any(app, "agent-summary-failures")
@@ -537,8 +619,9 @@ final class PerchE2ETests: XCTestCase {
 
         XCTAssertTrue(app.navigationBars["额度"].waitForExistence(timeout: 20), "did not reach the tabs")
         openTab(app, "路由组")
-        XCTAssertTrue(app.staticTexts["还不能改路由组"].waitForExistence(timeout: 20))
-        XCTAssertTrue(app.buttons["我已打开，再试一次"].exists)
+        // 1.5: the art state, no retry button.
+        XCTAssertTrue(any(app, "routing-noadmin").waitForExistence(timeout: 20), "no 这把密钥只能看额度 state")
+        XCTAssertTrue(app.staticTexts["这把密钥只能看额度"].exists)
         XCTAssertFalse(app.buttons["group-\(config.group)"].exists, "list shown without admin")
         shot(app, "03-routes-noadmin")
 
@@ -554,7 +637,7 @@ final class PerchE2ETests: XCTestCase {
             sleep(1)
         }
         routing.tap()
-        let help = app.staticTexts["这把密钥不能改路由组。在电脑的 magpie 里，密钥菜单 → 高级 → 管理 API，选「任何电脑均可」。"]
+        let help = app.staticTexts["这把密钥不能改路由组。在电脑的 magpie 里，这把密钥那一行点 ⋯ →「高级」→「管理 API」，选「任何电脑均可」。"]
         XCTAssertTrue(help.waitForExistence(timeout: 5), "no 403 line on tap")
         shot(app, "03b-settings-noadmin")
     }
@@ -677,6 +760,36 @@ final class PerchE2ETests: XCTestCase {
         XCTAssertTrue(app.buttons["group-pinned"].label.contains("手动，m-beta，另有 1 个"), app.buttons["group-pinned"].label)
         shot(app, "17-routes-after")
 
+        // Stopped and deleted groups on the real magpie: the stopped one is
+        // last, under 「已停用」, read-only; the deleted ones never show.
+        if let stopped = config.disabledGroup {
+            for id in config.deletedGroups ?? [] {
+                XCTAssertFalse(app.buttons["group-\(id)"].exists, "deleted group \(id) shown")
+            }
+            let stoppedRow = app.buttons["group-\(stopped)"]
+            for _ in 0..<6 where !(stoppedRow.exists && stoppedRow.isHittable) { app.swipeUp() }
+            XCTAssertTrue(stoppedRow.waitForExistence(timeout: 10), "stopped group missing")
+            XCTAssertTrue(stoppedRow.label.contains("已停用"), stoppedRow.label)
+            XCTAssertTrue(any(app, "routing-disabled-header").exists, "no 已停用 header")
+            let pinned = app.buttons["group-pinned"]
+            if pinned.exists {
+                XCTAssertGreaterThan(stoppedRow.frame.minY, pinned.frame.minY, "stopped group not last")
+            }
+            for id in config.deletedGroups ?? [] {
+                XCTAssertFalse(app.buttons["group-\(id)"].exists, "deleted group \(id) shown")
+            }
+            shot(app, "17b-routes-stopped")
+            stoppedRow.tap()
+            XCTAssertTrue(any(app, "group-disabled-note").waitForExistence(timeout: 10), "no 已停用 note")
+            XCTAssertFalse(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'make-primary-'")).firstMatch.exists,
+                           "设为首选 on a stopped group")
+            XCTAssertFalse(app.buttons["routing-mode"].exists, "选用方式 is a menu on a stopped group")
+            XCTAssertFalse(app.staticTexts["改完马上生效。正在跑的会话做完手上这一步就会跟上。"].exists, "改完马上生效 on a stopped group")
+            XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH 'member-' AND label CONTAINS '首选'")).firstMatch.exists, "首选 on a stopped group")
+            shot(app, "17c-group-stopped")
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+        }
+
         openTab(app, "设置")
         let key = app.staticTexts["settings-key"].firstMatch
         XCTAssertTrue(key.waitForExistence(timeout: 5))
@@ -766,6 +879,398 @@ final class PerchE2ETests: XCTestCase {
         back.tap()
         expectToast(app, "已换到 \(first)", "48-switched-back")
         XCTAssertTrue(any(app, "status-capsule").label.contains(first) || "\(any(app, "status-capsule").value ?? "")".contains(first))
+    }
+
+    // MARK: 1.5 slow network
+
+    /// Relaunch on the saved computer (no reset), with the Debug network hook.
+    private func relaunch(_ app: XCUIApplication, _ environment: [String: String]) -> XCUIApplication {
+        app.terminate()
+        let next = XCUIApplication()
+        next.launchArguments += ["-perch-long-toasts", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        next.launchEnvironment = environment
+        next.launch()
+        return next
+    }
+
+    private func waitLabel(_ element: XCUIElement, contains text: String, timeout: TimeInterval) -> Bool {
+        let p = NSPredicate(format: "label CONTAINS %@", text)
+        return XCTWaiter.wait(for: [expectation(for: p, evaluatedWith: element)], timeout: timeout) == .completed
+    }
+
+    /// Cache first, then each refresh outcome against the real magpie:
+    /// slow (正在刷新 → 还在刷新 → 刚刚更新, saved data shown throughout),
+    /// one block failing (card footer), the page failing while magpie
+    /// answers (banner + 重试) and magpie unreachable (offline card).
+    func test5_slowNetworkCacheFirstAndFailures() throws {
+        var app = launchFresh()
+        connect(app, key: config.key)
+        XCTAssertTrue(app.navigationBars["额度"].waitForExistence(timeout: 20), "did not reach the tabs")
+        dismissSystemPrompts(app)
+        // Fill the cache: Agent's page and 路由组 (with the agent's newest call).
+        openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+        XCTAssertTrue(any(app, "agent-tile-calls").waitForExistence(timeout: 20) || any(app, "agent-empty").exists, "Agent did not load")
+        let agentHasCalls = any(app, "agent-tile-calls").exists
+        openTab(app, "路由组")
+        XCTAssertTrue(app.buttons["group-\(config.group)"].waitForExistence(timeout: 20), "no groups")
+        let target = any(app, "agent-target-header")
+        let hasTarget = target.waitForExistence(timeout: 10)
+        let capsule = any(app, "status-capsule")
+        XCTAssertTrue(waitLabel(capsule, contains: "刚刚更新", timeout: 15), "capsule: \(capsule.label)")
+        XCTAssertFalse(any(app, "quotas-read-time").exists, "the old 「读取」 footer is back")
+        shot(app, "60-slownet-fresh")
+
+        // 1. Slow (7 s a request, under the 8 s groups timeout): the saved groups show at once, read-only
+        //    nothing blank; 正在刷新, 还在刷新 after 4 s, then 刚刚更新.
+        app = relaunch(app, ["PERCH_NET_DELAY_MS": "7000"])
+        openTab(app, "路由组")
+        XCTAssertTrue(app.buttons["group-\(config.group)"].waitForExistence(timeout: 3), "the saved groups did not show at once")
+        XCTAssertFalse(any(app, "loading").exists, "a skeleton over saved data")
+        let slowCapsule = any(app, "status-capsule")
+        XCTAssertTrue(slowCapsule.label.contains("正在刷新") || slowCapsule.label.contains("还在刷新") || waitLabel(slowCapsule, contains: "刷新", timeout: 3),
+                      "no 正在刷新: \(slowCapsule.label)")
+        shot(app, "61-slownet-refreshing")
+        XCTAssertTrue(waitLabel(slowCapsule, contains: "还在刷新", timeout: 8), "no 还在刷新: \(slowCapsule.label)")
+        XCTAssertTrue(app.buttons["group-\(config.group)"].exists, "the saved groups went away while slow")
+        shot(app, "62-slownet-still")
+        XCTAssertTrue(waitLabel(slowCapsule, contains: "刚刚更新", timeout: 20), "never 刚刚更新: \(slowCapsule.label)")
+        XCTAssertFalse(any(app, "stale-banner").exists, "a banner after a slow but good refresh")
+        if agentHasCalls {
+            openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+            XCTAssertTrue(any(app, "agent-tile-calls").waitForExistence(timeout: 3), "Agent's saved page did not show at once")
+            // The saved sentence doesn't count up from 0; it says the
+            // 调用 tile's number from the first frame.
+            let sentence = any(app, "agent-summary")
+            if sentence.exists {
+                let first = { (s: String) in s.range(of: #"[0-9][0-9,]*"#, options: .regularExpression).map { String(s[$0]) } }
+                let tile = any(app, "agent-tile-calls").value as? String ?? ""
+                XCTAssertEqual(first(sentence.label), first(tile), "summary \(sentence.label) vs tile \(tile)")
+            }
+        }
+
+        // 2. One block fails (the agent's calls): 路由组's 「刚刚在用」 card
+        //    keeps its call with a footer; Agent's page says it didn't read.
+        app = relaunch(app, ["PERCH_NET_FAIL_PATHS": "/v1/magpie/usage/requests"])
+        openTab(app, "路由组")
+        XCTAssertTrue(app.buttons["group-\(config.group)"].waitForExistence(timeout: 5))
+        if hasTarget {
+            let footer = any(app, "card-stale-footer")
+            XCTAssertTrue(footer.waitForExistence(timeout: 25), "no 这张没读到最新的 footer")
+            XCTAssertTrue(footer.label.contains("这张没读到最新的，还是"), footer.label)
+            XCTAssertTrue(any(app, "agent-target-header").exists, "the saved 刚刚在用 card went away")
+            XCTAssertFalse(any(app, "stale-banner").exists, "a whole-page banner for one block")
+            shot(app, "63-slownet-block-failed")
+        } else {
+            print("no 刚刚在用 card on this magpie: the block-footer check skips")
+        }
+        if agentHasCalls {
+            openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+            XCTAssertTrue(any(app, "agent-tile-calls").exists, "Agent's saved page went away")
+            let banner = any(app, "stale-banner")
+            XCTAssertTrue(banner.waitForExistence(timeout: 25), "no banner when the calls didn't read")
+            XCTAssertTrue(banner.label.contains("没读到最新的，下面是") || any(app, "stale-retry").exists, banner.label)
+            shot(app, "64-slownet-agent-banner")
+        }
+
+        // 3. magpie answers /me but no data (timeout): banner + 重试, the
+        //    capsule keeps the last time and stops spinning after 12 s.
+        app = relaunch(app, ["PERCH_NET_FAIL": "timeout"])
+        openTab(app, "路由组")
+        XCTAssertTrue(app.buttons["group-\(config.group)"].waitForExistence(timeout: 5))
+        let banner = any(app, "stale-banner")
+        XCTAssertTrue(banner.waitForExistence(timeout: 25), "no 没读到最新的 banner")
+        let failedCapsule = any(app, "status-capsule")
+        XCTAssertTrue(failedCapsule.label.contains("更新") && !failedCapsule.label.contains("刷新") && !failedCapsule.label.contains("连不上"),
+                      "capsule after a failed refresh: \(failedCapsule.label)")
+        // The banner's clock time, never 刚刚 / x 分钟前 (the
+        // cache was filled under a minute ago).
+        XCTAssertFalse(failedCapsule.label.contains("刚刚") || failedCapsule.label.contains("分钟前"),
+                       "capsule beside the banner says a relative time: \(failedCapsule.label)")
+        if let clock = failedCapsule.label.range(of: #"\d{2}:\d{2}"#, options: .regularExpression) {
+            XCTAssertTrue(banner.label.contains(String(failedCapsule.label[clock])) || !banner.label.contains("下面是"),
+                          "capsule \(failedCapsule.label) and banner \(banner.label) give different times")
+        } else {
+            XCTFail("no clock time in the capsule: \(failedCapsule.label)")
+        }
+        shot(app, "65-slownet-failed-banner")
+        let retry = any(app, "stale-retry")
+        XCTAssertTrue(retry.exists, "no 重试")
+        retry.tap()
+        XCTAssertTrue(waitLabel(failedCapsule, contains: "刷新", timeout: 3), "重试 didn't start a refresh: \(failedCapsule.label)")
+        XCTAssertTrue(banner.exists, "the banner left while retrying")
+        XCTAssertTrue(waitLabel(failedCapsule, contains: "更新", timeout: 20), "retry never ended: \(failedCapsule.label)")
+        XCTAssertTrue(banner.waitForExistence(timeout: 5), "no banner after the retry failed too")
+
+        // 4. Unreachable: offline card, the saved groups dimmed, 连不上.
+        app = relaunch(app, ["PERCH_NET_FAIL": "offline"])
+        openTab(app, "路由组")
+        XCTAssertTrue(app.buttons["group-\(config.group)"].waitForExistence(timeout: 5), "the saved groups did not show")
+        let offline = any(app, "offline-card")
+        XCTAssertTrue(offline.waitForExistence(timeout: 20), "no offline card")
+        let offCapsule = any(app, "status-capsule")
+        XCTAssertTrue(waitLabel(offCapsule, contains: "连不上", timeout: 5), "capsule: \(offCapsule.label)")
+        XCTAssertFalse(any(app, "stale-banner").exists, "a banner as well as the offline card")
+        XCTAssertFalse(any(app, "card-stale-footer").exists, "a card footer as well as the offline card")
+        shot(app, "66-slownet-offline")
+        openTab(app, "额度")
+        XCTAssertTrue(any(app, "offline-card").waitForExistence(timeout: 20), "no offline card on 额度")
+        XCTAssertFalse(any(app, "card-stale-footer").exists, "a card footer on 额度 while 连不上")
+        XCTAssertFalse(any(app, "stale-banner").exists, "a banner on 额度 while 连不上")
+        if agentHasCalls {
+            openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+            XCTAssertTrue(any(app, "offline-card").waitForExistence(timeout: 20), "no offline card on Agent")
+            XCTAssertFalse(any(app, "card-stale-footer").exists, "a block footer on Agent while 连不上")
+            XCTAssertFalse(any(app, "stale-banner").exists, "a banner on Agent while 连不上")
+        }
+
+        // Back on a good network: the card goes, 刚刚更新.
+        app = relaunch(app, [:])
+        openTab(app, "路由组")
+        XCTAssertTrue(waitLabel(any(app, "status-capsule"), contains: "刚刚更新", timeout: 20))
+        XCTAssertFalse(any(app, "offline-card").exists)
+        XCTAssertFalse(any(app, "stale-banner").exists)
+    }
+
+    // MARK: Upgrade from an older build (scripts/upgrade.sh)
+
+    /// scripts/upgrade.sh installs an older build ($OLD_REV, Release) and runs
+    /// step `old`, then installs this build (Release) over it and runs `new`:
+    /// a user's update path. Unset: not an upgrade run.
+    private var upgradeStep: String? { ProcessInfo.processInfo.environment["PERCH_UPGRADE_STEP"] }
+
+    private func visitEveryTab(_ app: XCUIApplication) {
+        openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+        sleep(3)
+        openTab(app, "路由组")
+        sleep(3)
+        openTab(app, "设置")
+        sleep(1)
+        openTab(app, "额度")
+        sleep(3)
+    }
+
+    /// The old build: connect, use every tab, so it saves what it saves.
+    func test8a_upgradeOldBuildSavesState() throws {
+        guard upgradeStep == "old" else { throw XCTSkip("upgrade runs only in scripts/upgrade.sh") }
+        let app = launchFresh()
+        connect(app, key: config.key)
+        for i in 0..<15 where !app.navigationBars["额度"].exists {
+            dismissSystemPrompts(app)
+            let button = app.buttons["connect-button"]
+            if i % 4 == 3, button.exists, button.isHittable { button.tap() }
+            sleep(2)
+        }
+        XCTAssertTrue(app.navigationBars["额度"].waitForExistence(timeout: 10), "the old build did not reach the tabs")
+        dismissSystemPrompts(app)
+        visitEveryTab(app)
+        shot(app, "80-upgrade-old")
+        app.terminate()
+    }
+
+    /// This build over the old one, launched the way the Home Screen does
+    /// (no arguments): it must come up and stay up, twice (the second
+    /// launch reads what this build saved itself).
+    func test8b_upgradeNewBuildLaunches() throws {
+        guard upgradeStep == "new" else { throw XCTSkip("upgrade runs only in scripts/upgrade.sh") }
+        for round in 1...2 {
+            let app = XCUIApplication()
+            app.launch()
+            sleep(6)
+            XCTAssertEqual(app.state, .runningForeground, "launch \(round) after the upgrade: the app is not running (crashed?)")
+            XCTAssertTrue(app.tabBars.firstMatch.waitForExistence(timeout: 10), "launch \(round): no tabs (the saved computer was lost?)")
+            visitEveryTab(app)
+            XCTAssertEqual(app.state, .runningForeground, "launch \(round): the app died while using the tabs")
+            shot(app, "8\(round)-upgrade-new")
+            app.terminate()
+        }
+    }
+
+    /// The same, with magpie gone (`dead`: connection refused) or hanging
+    /// (`hang`: accepts, never answers), past the 12 s budget and the /me
+    /// probe: the Release failure paths, without the Debug network hook.
+    func test8c_upgradeNewBuildWithoutMagpie() throws {
+        guard let step = upgradeStep, step == "dead" || step == "hang" else { throw XCTSkip("upgrade runs only in scripts/upgrade.sh") }
+        let app = XCUIApplication()
+        app.launch()
+        for second in stride(from: 0, through: 30, by: 3) {
+            sleep(3)
+            XCTAssertEqual(app.state, .runningForeground, "\(step): the app died about \(second + 3) s after launch")
+        }
+        visitEveryTab(app)
+        sleep(15)
+        XCTAssertEqual(app.state, .runningForeground, "\(step): the app died while using the tabs")
+        shot(app, "83-upgrade-\(step)")
+        app.terminate()
+    }
+
+    // MARK: 1.5 slow-network recordings (scripts/e2e.sh's second pass)
+
+    /// The host folder scripts/e2e.sh watches: `<name>.start` starts
+    /// `simctl io recordVideo`, `<name>.stop` ends it. Unset: not a video run.
+    private var videoDir: URL? {
+        ProcessInfo.processInfo.environment["PERCH_VIDEO_DIR"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+    }
+
+    private func waitFile(_ url: URL, timeout: TimeInterval) -> Bool {
+        let end = Date().addingTimeInterval(timeout)
+        while Date() < end {
+            if FileManager.default.fileExists(atPath: url.path) { return true }
+            usleep(100_000)
+        }
+        return false
+    }
+
+    /// Connect, fill the caches (Agent's page, 路由组 with its newest call),
+    /// quit: each clip starts from saved data.
+    private func videoSetup() throws -> URL {
+        guard let dir = videoDir else { throw XCTSkip("recordings run only in scripts/e2e.sh's video pass") }
+        let app = launchFresh()
+        connect(app, key: config.key)
+        // A fresh Simulator asks for 本地网络 on the first connect: allow,
+        // connect again if that first try was refused.
+        for i in 0..<15 where !app.navigationBars["额度"].exists {
+            dismissSystemPrompts(app)
+            let button = app.buttons["connect-button"]
+            if i % 4 == 3, button.exists, button.isHittable { button.tap() }
+            sleep(2)
+        }
+        XCTAssertTrue(app.navigationBars["额度"].waitForExistence(timeout: 10), "did not reach the tabs")
+        dismissSystemPrompts(app)
+        openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+        XCTAssertTrue(any(app, "agent-tile-calls").waitForExistence(timeout: 20), "Agent did not load")
+        openTab(app, "路由组")
+        XCTAssertTrue(app.buttons["group-\(config.group)"].waitForExistence(timeout: 20), "no groups")
+        _ = any(app, "agent-target-header").waitForExistence(timeout: 10)
+        XCTAssertTrue(waitLabel(any(app, "status-capsule"), contains: "刚刚更新", timeout: 15))
+        // Let a few more calls land (e2e.sh keeps making them) so the
+        // refresh in the clip rolls numbers to new values.
+        sleep(6)
+        app.terminate()
+        return dir
+    }
+
+    /// Records `body` as `<name>.mp4` (under 30 s).
+    private func clip(_ name: String, in dir: URL, _ body: () -> Void) {
+        let started = Date()
+        FileManager.default.createFile(atPath: dir.appending(path: name + ".start").path, contents: nil)
+        XCTAssertTrue(waitFile(dir.appending(path: name + ".recording"), timeout: 20), "the recording of \(name) did not start")
+        usleep(500_000)
+        body()
+        sleep(2)
+        FileManager.default.createFile(atPath: dir.appending(path: name + ".stop").path, contents: nil)
+        XCTAssertTrue(waitFile(dir.appending(path: name + ".done"), timeout: 30), "the recording of \(name) did not end")
+        print("SLOWNET-VIDEO \(name): \(Int(Date().timeIntervalSince(started))) s")
+    }
+
+    private func launchVideo(_ environment: [String: String]) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments += ["-perch-long-toasts", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launchEnvironment = environment
+        app.launch()
+        return app
+    }
+
+    /// Slow (7 s a request): saved numbers at once, 正在刷新 → 还在刷新 →
+    /// 刚刚更新, the call count rolling to the new value.
+    func test9a_videoSlow() throws {
+        let dir = try videoSetup()
+        clip("1-slow", in: dir) {
+            let app = launchVideo(["PERCH_NET_DELAY_MS": "7000"])
+            openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+            let capsule = any(app, "status-capsule")
+            XCTAssertTrue(waitLabel(capsule, contains: "还在刷新", timeout: 10), "no 还在刷新: \(capsule.label)")
+            XCTAssertTrue(waitLabel(capsule, contains: "刚刚更新", timeout: 15), "never 刚刚更新: \(capsule.label)")
+            sleep(2)
+        }
+    }
+
+    /// The agent's calls don't read: 路由组's 刚刚在用 card keeps its call
+    /// with the footer; a tap on it (the failure over) reads it again.
+    func test9b_videoBlockFailed() throws {
+        let dir = try videoSetup()
+        clip("2-block-failed", in: dir) {
+            let app = launchVideo(["PERCH_NET_FAIL_PATHS": "/v1/magpie/usage/requests", "PERCH_NET_FAIL_FOR_S": "12"])
+            openTab(app, "路由组")
+            let footer = any(app, "card-stale-footer")
+            XCTAssertTrue(footer.waitForExistence(timeout: 20), "no card footer")
+            XCTAssertFalse(any(app, "stale-banner").exists)
+            sleep(3)
+            footer.tap()
+            let gone = NSPredicate(format: "exists == false")
+            XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: gone, evaluatedWith: footer)], timeout: 12), .completed, "the footer stayed after a good retry")
+            sleep(1)
+        }
+    }
+
+    /// Nothing reads while magpie answers /me: banner + 重试 at 12 s; 重试
+    /// (the failure over) refreshes, the banner goes, numbers roll.
+    func test9c_videoPageFailed() throws {
+        let dir = try videoSetup()
+        clip("3-page-failed", in: dir) {
+            let app = launchVideo(["PERCH_NET_FAIL": "timeout", "PERCH_NET_FAIL_FOR_S": "13"])
+            openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+            let banner = any(app, "stale-banner")
+            XCTAssertTrue(banner.waitForExistence(timeout: 20), "no banner")
+            let capsule = any(app, "status-capsule")
+            XCTAssertFalse(capsule.label.contains("刚刚") || capsule.label.contains("分钟前"), "capsule beside the banner: \(capsule.label)")
+            sleep(2)
+            any(app, "stale-retry").tap()
+            XCTAssertTrue(waitLabel(any(app, "status-capsule"), contains: "刚刚更新", timeout: 12), "retry did not refresh")
+            let gone = NSPredicate(format: "exists == false")
+            XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: gone, evaluatedWith: banner)], timeout: 5), .completed, "the banner stayed")
+        }
+    }
+
+    /// Unreachable: the offline card, saved data dimmed, 连不上, no footers;
+    /// then the computer is back: 重试 reconnects, numbers roll.
+    func test9d_videoOffline() throws {
+        let dir = try videoSetup()
+        clip("4-offline", in: dir) {
+            let app = launchVideo(["PERCH_NET_FAIL": "offline", "PERCH_NET_FAIL_FOR_S": "9"])
+            openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+            let card = any(app, "offline-card")
+            XCTAssertTrue(card.waitForExistence(timeout: 15), "no offline card")
+            XCTAssertTrue(waitLabel(any(app, "status-capsule"), contains: "连不上", timeout: 5))
+            XCTAssertFalse(any(app, "card-stale-footer").exists, "a footer while 连不上")
+            XCTAssertFalse(any(app, "stale-banner").exists, "a banner while 连不上")
+            sleep(6)
+            any(app, "offline-retry").tap()
+            XCTAssertTrue(waitLabel(any(app, "status-capsule"), contains: "刚刚更新", timeout: 12), "did not reconnect")
+            XCTAssertFalse(card.exists, "the offline card stayed")
+        }
+    }
+
+    /// The Agent summary shows its saved number at once,
+    /// never counting up from 0, then rolls old → new on a refresh, the
+    /// same number as the 调用 tile whenever they're read.
+    func test9e_videoSummary() throws {
+        let dir = try videoSetup()
+        clip("5-summary", in: dir) {
+            let app = launchVideo([:])
+            openTab(app, "Agent", ready: any(app, "agent-title-menu"))
+            let sentence = any(app, "agent-summary")
+            let tile = any(app, "agent-tile-calls")
+            XCTAssertTrue(sentence.waitForExistence(timeout: 5), "no summary")
+            let number = { (s: String) in s.range(of: #"[0-9][0-9,]*"#, options: .regularExpression).map { String(s[$0]) } }
+            var seen: [String] = []
+            func check() -> String? {
+                let said = number(sentence.label), shows = number("\(tile.value ?? "")")
+                XCTAssertEqual(said, shows, "summary \(sentence.label) vs tile \(tile.value ?? "")")
+                XCTAssertNotEqual(said, "0", "the summary says 0: \(sentence.label)")
+                if let said, seen.last != said { seen.append(said) }
+                return said
+            }
+            let first = check()
+            for _ in 0..<6 { _ = check(); usleep(250_000) }
+            // Pull to refresh until a newer count lands (e2e.sh keeps making calls).
+            for _ in 0..<2 where check() == first {
+                app.swipeDown()
+                for _ in 0..<24 where check() == first { usleep(250_000) }
+            }
+            for _ in 0..<6 { _ = check(); usleep(250_000) }
+            XCTAssertTrue(waitLabel(any(app, "status-capsule"), contains: "刚刚更新", timeout: 12))
+            print("SUMMARY-NUMBERS \(seen.joined(separator: " "))")
+        }
     }
 
     /// A computer in the capsule menu. iOS menu items with a subtitle do not

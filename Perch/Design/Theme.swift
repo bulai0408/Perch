@@ -106,6 +106,19 @@ enum Motion {
 
     /// `calm`, or a short fade under Reduce Motion.
     static func calm(_ reduce: Bool) -> Animation { reduce ? fade : calm }
+
+    /// The offline card or the page banner going away: height and
+    /// opacity to 0 together in 0.3 s. Under Reduce Motion it just goes
+    /// (no collapse, no content moving).
+    static let collapse = Animation.easeInOut(duration: 0.3)
+    /// The page banner: in with opacity + move 0.3 s, out collapsing.
+    static func banner(_ reduce: Bool, showing: Bool) -> Animation? {
+        showing ? (reduce ? fade : .easeOut(duration: 0.3)) : (reduce ? nil : collapse)
+    }
+    /// The offline card: fade to unreachable 0.4 s, out collapsing.
+    static func offline(_ reduce: Bool, showing: Bool) -> Animation? {
+        showing ? (reduce ? fade : .easeOut(duration: 0.4)) : (reduce ? nil : collapse)
+    }
     /// `settle`, or a short fade under Reduce Motion.
     static func settle(_ reduce: Bool) -> Animation { reduce ? fade : settle }
     /// `lift`, staggered 50 ms per `index` (up to 6), or a fade.
@@ -123,14 +136,17 @@ enum Motion {
 struct RiseIn: ViewModifier {
     var index: Int = 0
     @Environment(\.accessibilityReduceMotion) private var reduce
+    @Environment(\.fromCache) private var fromCache
     @State private var shown = false
 
     func body(content: Content) -> some View {
         content
-            .opacity(shown ? 1 : 0)
-            .offset(y: shown || reduce ? 0 : 14)
+            .opacity(shown || fromCache ? 1 : 0)
+            .offset(y: shown || reduce || fromCache ? 0 : 14)
             .onAppear {
                 guard !shown else { return }
+                // Saved data is just there, no entrance.
+                if fromCache { shown = true; return }
                 withAnimation(Motion.lift(reduce, index: index)) { shown = true }
             }
             .task {
@@ -140,6 +156,11 @@ struct RiseIn: ViewModifier {
                 if !shown { withAnimation(Motion.fade) { shown = true } }
             }
     }
+}
+
+extension EnvironmentValues {
+    /// What's on screen came from the disk cache (no rise, no grow).
+    @Entry var fromCache = false
 }
 
 extension View {
@@ -157,6 +178,8 @@ enum Haptic {
     static let toggled = SensoryFeedback.impact(weight: .medium)
     static let selection = SensoryFeedback.selection
     static let refreshed = SensoryFeedback.impact(flexibility: .soft, intensity: 0.5)
+    /// 1.5: a pull to refresh that didn't read.
+    static let refreshFailed = SensoryFeedback.warning
     static let runOut = SensoryFeedback.warning
 }
 

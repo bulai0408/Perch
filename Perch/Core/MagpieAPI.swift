@@ -31,7 +31,7 @@ enum MagpieAPIError: Error, Equatable, Sendable {
         case .localNetworkDenied: QuotaError.localNetworkDenied.message
         case .unauthorized: RoutingError.unauthorized.message
         case .held: String(localized: "这把密钥在 magpie 里被限定了预算、模型或账号，看不到 Agent 的用量。换一把不加限定的密钥。")
-        case .readOnly, .notAdmin: String(localized: "这把密钥不能改路由组。在电脑的 magpie 里，密钥菜单 → 高级 → 管理 API，选「任何电脑均可」。")
+        case .readOnly, .notAdmin: String(localized: "这把密钥不能改路由组。在电脑的 magpie 里，这把密钥那一行点 ⋯ →「高级」→「管理 API」，选「任何电脑均可」。")
         case .accountsOff: String(localized: "magpie 里的订阅账号功能是关着的。在电脑上 magpie 的「设置 → 隐私」打开。")
         case .unsupported: QuotaError.other("404").message
         case .rejected: String(localized: "没改成，账号状态没动。")
@@ -96,20 +96,28 @@ struct MagpieClient: Sendable {
     /// `GET /v1/magpie/usage?period=`: the Usage page's summary for every
     /// agent. magpie ignores `agent=` here; use `requests` for one agent.
     func usage(_ period: UsagePeriod) async throws(MagpieAPIError) -> UsageSummary {
+        try await usageWithData(period).value
+    }
+
+    func usageWithData(_ period: UsagePeriod) async throws(MagpieAPIError) -> (value: UsageSummary, data: Data) {
         let data = try await send("GET", "/v1/magpie/usage", query: [.init(name: "period", value: period.rawValue)])
         guard let summary = UsageDecoding.summary(from: data) else { throw .other("JSON") }
-        return summary
+        return (summary, data)
     }
 
     /// `GET /v1/magpie/usage/requests`: one page (newest first) plus the
     /// filtered totals and splits (`by.model`, `by.modelAt`, `by.provider`).
     func requests(_ filter: UsageFilter, offset: Int = 0, limit: Int = 100) async throws(MagpieAPIError) -> UsageRequestsPage {
+        try await requestsWithData(filter, offset: offset, limit: limit).value
+    }
+
+    func requestsWithData(_ filter: UsageFilter, offset: Int = 0, limit: Int = 100) async throws(MagpieAPIError) -> (value: UsageRequestsPage, data: Data) {
         var query = filter.queryItems
         query.append(.init(name: "offset", value: String(max(0, offset))))
         query.append(.init(name: "limit", value: String(min(max(1, limit), 500))))
         let data = try await send("GET", "/v1/magpie/usage/requests", query: query)
         guard let page = UsageDecoding.requestsPage(from: data) else { throw .other("JSON") }
-        return page
+        return (page, data)
     }
 
     // MARK: 1.4
@@ -126,36 +134,46 @@ struct MagpieClient: Sendable {
     /// `GET /v1/magpie/route-events/snapshot`: calls in flight now (any
     /// unheld key, read-only too; a held key gets 403).
     func routeSnapshot() async throws(MagpieAPIError) -> [LiveRoute] {
-        let data = try await send("GET", "/v1/magpie/route-events/snapshot", query: [], timeout: 6)
+        let data = try await send("GET", "/v1/magpie/route-events/snapshot", query: [], timeout: 10)
         return LiveDecoding.snapshot(from: data)
     }
 
     /// `GET /v1/magpie/concurrency` `active[]`: when each call started.
     func concurrency() async throws(MagpieAPIError) -> [LiveActive] {
-        let data = try await send("GET", "/v1/magpie/concurrency", query: [], timeout: 6)
+        let data = try await send("GET", "/v1/magpie/concurrency", query: [], timeout: 10)
         return LiveDecoding.active(from: data)
     }
 
     /// `GET /v1/magpie/route?session=`: why earlier tries failed
     /// (`tries[].fail`). A read-only key gets 403.
     func sessionRoute(_ session: String) async throws(MagpieAPIError) -> [String] {
-        let data = try await send("GET", "/v1/magpie/route", query: [.init(name: "session", value: session)], timeout: 6)
+        let data = try await send("GET", "/v1/magpie/route", query: [.init(name: "session", value: session)], timeout: 10)
         return LiveDecoding.tryFailures(from: data)
     }
 
     // MARK: Quotas
 
     /// `GET /v1/magpie/quotas`: the cards with `lastServedAt` and `last`.
-    func quotas() async throws(MagpieAPIError) -> [QuotaCard] {
-        let data = try await send("GET", "/v1/magpie/quotas", query: [])
-        do { return try QuotaDecoding.cards(from: data) } catch { throw .other("JSON") }
+    /// `kept`: magpie's last reading, asking no vendor (`?kept=1`); without
+    /// it magpie asks every vendor (up to 12 s).
+    func quotas(kept: Bool = true) async throws(MagpieAPIError) -> [QuotaCard] {
+        try await quotasWithData(kept: kept).value
+    }
+
+    func quotasWithData(kept: Bool = true) async throws(MagpieAPIError) -> (value: [QuotaCard], data: Data) {
+        let data = try await send("GET", "/v1/magpie/quotas", query: kept ? [.init(name: "kept", value: "1")] : [])
+        do { return (try QuotaDecoding.cards(from: data), data) } catch { throw .other("JSON") }
     }
 
     /// `GET /v1/magpie/quotas/history`. Its items' shape isn't documented;
     /// the result says so rather than failing.
     func quotaHistory() async throws(MagpieAPIError) -> QuotaHistory {
+        try await quotaHistoryWithData().value
+    }
+
+    func quotaHistoryWithData() async throws(MagpieAPIError) -> (value: QuotaHistory, data: Data) {
         let data = try await send("GET", "/v1/magpie/quotas/history", query: [])
-        return QuotaHistoryDecoding.history(from: data)
+        return (QuotaHistoryDecoding.history(from: data), data)
     }
 
     /// `GET /v1/magpie/limit`: what this key itself is held to.

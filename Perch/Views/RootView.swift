@@ -81,13 +81,18 @@ struct MainTabs: View {
                     }
             }
         }
-        // 换一台电脑: every tab reads the new computer from scratch.
-        .onChange(of: connection.currentID) { _, _ in
-            quotas.reset()
-            routing.reset()
-            usage.reset()
-        }
+        // 1.5: every tab shows this computer's saved data at once, before
+        // its first read. 换一台电脑 swaps to the other computer's.
+        .onAppear { useCurrent() }
+        .onChange(of: connection.currentID) { _, _ in useCurrent() }
         .toast(Binding(get: { connection.toast }, set: { connection.toast = $0 }))
+    }
+
+    private func useCurrent() {
+        let id = connection.currentID
+        quotas.use(id)
+        routing.use(id)
+        usage.use(id)
     }
 }
 
@@ -132,75 +137,6 @@ extension EnvironmentValues {
     @Entry var openAgentTab = OpenSettingsAction()
     /// 1.4 「添加电脑…」: the 添加电脑 sheet.
     @Entry var addComputer = OpenSettingsAction()
-}
-
-/// The trailing toolbar capsule on every tab: a dot
-/// and the computer's name, 「· 2 分钟前」 on 额度, 「· 连不上」 when
-/// magpie can't be reached. 1.4: tapping it opens 「换一台电脑」.
-struct StatusCapsule: View {
-    let computer: String
-    /// 「2 分钟前」 on 额度; nil on 路由组.
-    var ago: String?
-    let offline: Bool
-
-    @Environment(ConnectionStore.self) private var connection
-    @Environment(\.addComputer) private var addComputer
-
-    private var text: String {
-        if offline { return String(localized: "\(computer) · 连不上") }
-        if let ago { return "\(computer) · \(ago)" }
-        return computer
-    }
-
-    var body: some View {
-        Menu {
-            Section("换一台电脑") {
-                ForEach(connection.computers) { c in
-                    Button {
-                        connection.select(c.id)
-                    } label: {
-                        if c.id == connection.currentID {
-                            Label(c.name, systemImage: "checkmark")
-                        } else {
-                            Text(verbatim: c.name)
-                        }
-                        Text(verbatim: ComputerStatusText.menu(connection.status(of: c), current: c.id == connection.currentID, offline: offline))
-                    }
-                    .accessibilityIdentifier("computer-menu-\(c.name)")
-                }
-            }
-            Divider()
-            Button {
-                addComputer()
-            } label: {
-                Label("添加电脑…", systemImage: "plus")
-            }
-            .accessibilityIdentifier("add-computer-menu")
-        } label: {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(offline ? Color.warn : Color.good)
-                    .frame(width: 7, height: 7)
-                Text(verbatim: text)
-                    .font(.system(size: 13).monospacedDigit())
-                    .foregroundStyle(.ink)
-                    .contentTransition(.numericText())
-                    .animation(Motion.calm, value: text)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 32)
-            .frame(maxWidth: 220)
-            .background(Color.card, in: .capsule)
-            .overlay(Capsule().strokeBorder(Color.hairline, lineWidth: 0.5))
-            .contentShape(.capsule)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(Text("连接状态，轻点换一台电脑"))
-        .accessibilityValue(Text(verbatim: text))
-        .accessibilityIdentifier("status-capsule")
-    }
 }
 
 /// 「● 已连接」 / 「● 连不上」 / 「上次连上：2 小时前」.

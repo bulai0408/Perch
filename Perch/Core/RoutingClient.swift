@@ -22,7 +22,7 @@ enum RoutingError: Error, Equatable, Sendable {
         case .timeout: QuotaError.timeout.message
         case .localNetworkDenied: QuotaError.localNetworkDenied.message
         case .unauthorized: String(localized: "密钥对不上了，可能已在电脑上删掉。到「设置 → 电脑」重新填一把。")
-        case .notAdmin: String(localized: "这把密钥不能改路由组。在电脑的 magpie 里，密钥菜单 → 高级 → 管理 API，选「任何电脑均可」。")
+        case .notAdmin: String(localized: "这把密钥不能改路由组。在电脑的 magpie 里，这把密钥那一行点 ⋯ →「高级」→「管理 API」，选「任何电脑均可」。")
         case .rejected: String(localized: "没改成，一切保持原样。")
         case .other(let code): QuotaError.other(code).message
         }
@@ -72,12 +72,17 @@ struct RoutingClient: Sendable {
     let key: String
 
     /// Every route below is relative to this path.
-    private static let root = "/v1/magpie/admin/routing-groups"
+    static let root = "/v1/magpie/admin/routing-groups"
 
     /// `GET routing-groups`: every group, in magpie's list order.
     func groups(timeout: TimeInterval = 8) async throws(RoutingError) -> [RoutingGroup] {
+        try await groupsWithData(timeout: timeout).value
+    }
+
+    /// The groups and magpie's raw answer (for the disk cache).
+    func groupsWithData(timeout: TimeInterval = 8) async throws(RoutingError) -> (value: [RoutingGroup], data: Data) {
         let data = try await send(method: "GET", path: Self.root, body: nil, timeout: timeout)
-        do { return try RoutingDecoding.groups(from: data) } catch { throw .other("JSON") }
+        do { return (try RoutingDecoding.groups(from: data), data) } catch { throw .other("JSON") }
     }
 
     /// `GET routing-groups/{id}`.

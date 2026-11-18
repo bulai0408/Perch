@@ -28,7 +28,6 @@ struct ConnectView: View {
     @State private var shakes: CGFloat = 0
     @State private var didPrefill = false
     @State private var artIn = false
-    @State private var showsAdminHelp = false
 
     /// The text fields, for focus.
     @FocusState private var focus: Field?
@@ -54,7 +53,7 @@ struct ConnectView: View {
                     intro
                     fields
                         .modifier(Shake(amount: reduce ? 0 : 6, shakes: shakes))
-                    if let quotaError { errorCard(quotaError) }
+                    if let quotaError, !showsChecks { errorCard(quotaError) }
                     if quotaOK, adminNote {
                         Text("已连上，可以看额度。要改路由组，再给这把密钥打开管理 API。")
                             .font(.footnote)
@@ -141,26 +140,91 @@ struct ConnectView: View {
         }
     }
 
+    /// 「在电脑上开好 magpie」: five numbered steps, then the optional
+    /// routing-group line one size down (guide v2).
+    private static let steps: [LocalizedStringKey] = [
+        "在电脑上打开 magpie，点左边的「网关」。",
+        "在「局域网共享」那一行，点「局域网」。",
+        "在「网关密钥」右边点「添加网关密钥」，名字随便填（比如 手机），「自定义密钥（可选）」空着，点「创建」。",
+        "在「网关」页复制标着「局域网」的那条地址，粘到下面的「地址」里。不要用标着「本机」的那条。",
+        "点这把密钥那一行的复制按钮，粘到下面的「密钥」里。别的都不用改。",
+    ]
+
     private var intro: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("在电脑的 magpie 里打开「设置 → 网络与共享 → 在局域网共享」，再新建一把密钥，打开「可看额度」。")
-                .font(.subheadline)
+        VStack(alignment: .leading, spacing: 10) {
+            Text("在电脑上开好 magpie")
+                .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.ink)
-                .fixedSize(horizontal: false, vertical: true)
-            DisclosureGroup(isExpanded: $showsAdminHelp) {
-                Text("在这把密钥那一行的菜单 → 高级 → 管理 API，选「任何电脑均可」。")
-                    .font(.footnote)
-                    .foregroundStyle(.ink2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 4)
-            } label: {
-                // PingFang so 「？」 is the full-width glyph (SF draws U+FF1F narrow).
-                Text("想在手机上改路由组？")
-                    .font(.custom("PingFangSC-Regular", size: 15, relativeTo: .subheadline))
+                .accessibilityAddTraits(.isHeader)
+            ForEach(Self.steps.indices, id: \.self) { index in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(index + 1, format: .number)
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(.tint)
+                        .frame(minWidth: 14, alignment: .leading)
+                        .accessibilityHidden(true)
+                    Text(Self.steps[index])
+                        .font(.subheadline)
+                        .foregroundStyle(.ink)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("guide-step-\(index + 1)")
             }
-            .tint(.accentColor)
+            Text("想在手机上改路由组：在这把密钥那一行点 ⋯ →「高级」→「管理 API」，选「任何电脑均可」。")
+                .font(.footnote)
+                .foregroundStyle(.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 2)
+                .accessibilityIdentifier("guide-routing")
         }
+    }
+
+    /// Under 地址 when an address was entered but Perch couldn't reach it (guide v2).
+    private static let checks: [LocalizedStringKey] = [
+        "手机和电脑在同一个 Wi-Fi 上",
+        "magpie 的「网关」页里，「局域网共享」选的是「局域网」",
+        "地址用的是标着「局域网」的那条",
+        "电脑的防火墙没拦住 magpie",
+    ]
+
+    /// The same list for a Tailscale address (100.64/10, *.ts.net, a bare name, fd7a:115c:a1e0::/48).
+    private static let tailscaleChecks: [LocalizedStringKey] = [
+        "手机和电脑都开着 Tailscale，登的是同一个账号",
+        "电脑上的 Tailscale 允许别的设备连进来",
+        "magpie 的「网关」页里，「局域网共享」选的是「局域网」",
+        "电脑的防火墙对 Tailscale 也放行了 magpie",
+    ]
+
+    private var shownChecks: [LocalizedStringKey] {
+        let host = MagpieAddress.normalize(addressText)?.host(percentEncoded: false)
+        return host.map(MagpieAddress.isTailscale(host:)) == true ? Self.tailscaleChecks : Self.checks
+    }
+
+    private var showsChecks: Bool {
+        !addressText.trimmed.isEmpty && (quotaError == .unreachable || quotaError == .timeout)
+    }
+
+    private var checksList: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("连不上这台电脑。看看：")
+                .foregroundStyle(.ink)
+            let checks = shownChecks
+            ForEach(checks.indices, id: \.self) { index in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(verbatim: "•").accessibilityHidden(true)
+                    Text(checks[index]).fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundStyle(.ink2)
+            }
+        }
+        .font(.footnote)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, 54)
+        .padding(.bottom, 12)
+        .transition(.opacity)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("address-checks")
     }
 
     // MARK: 地址 + 密钥
@@ -191,6 +255,7 @@ struct ConnectView: View {
                         .onSubmit { focus = showsSavedKey ? nil : .key }
                         .accessibilityIdentifier("address-field")
                 }
+                if showsChecks { checksList }
                 Divider().overlay(Color.hairline).padding(.leading, 70)
                 FieldRow(label: "密钥") {
                     if showsSavedKey, let masked = connection.maskedKey {
@@ -376,7 +441,7 @@ struct ConnectView: View {
         withAnimation(Motion.calm(reduce)) { quotaError = error }
         failures += 1
         if !reduce { withAnimation(.linear(duration: 0.4)) { shakes += 1 } }
-        AccessibilityNotification.Announcement(error.message).post()
+        AccessibilityNotification.Announcement(showsChecks ? String(localized: "连不上这台电脑。看看：") : error.message).post()
         focus = error == .unauthorized && !showsSavedKey ? .key : nil
     }
 }

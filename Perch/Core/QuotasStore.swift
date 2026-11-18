@@ -26,17 +26,22 @@ final class QuotasStore {
     private(set) var cards: [QuotaCard] = []
     /// The latest read's state; drives loading/error screens.
     private(set) var phase: Phase = .idle
+    /// 1.5: when the cards were read, whether a load runs, how it ended.
+    private(set) var freshness = Freshness()
     /// When the cards shown were last read successfully.
-    private(set) var lastRead: Date?
-    /// Set when the latest read failed but older cards are still shown.
-    private(set) var staleSince: Date?
-    /// Card ids being refreshed one by one right now.
+    var lastRead: Date? { freshness.lastRead }
+    /// What's shown came from the disk cache; no fresh answer yet.
+    private(set) var fromCache = false
+    /// Cards whose own refresh failed: when their shown data was read.
+    private(set) var cardStale: [String: Date] = [:]
+    /// The computer whose data this is (the disk cache's folder).
+    private(set) var computerID: String?
     private(set) var refreshing: Set<String> = []
     /// Bumped when a manual refresh ends: the sky's brightness breath.
     var breath = 0
     /// When each card was last refreshed (for the 30 s cooldown).
     private var lastCardRefresh: [String: Date] = [:]
-    /// `/v1/magpie/quotas` (for `lastServedAt`); empty when unread.
+    /// `/v1/magpie/quotas?kept=1` (for `lastServedAt`); empty when unread.
     private(set) var served: [QuotaCard] = []
     /// `/usage?period=7d` and `today`, for the order and account details.
     private(set) var usageWeek: UsageSummary?
@@ -53,7 +58,14 @@ final class QuotasStore {
     /// most), for the run-out pace when magpie keeps no history.
     private(set) var reads: [String: [UsageSample]] = [:]
 
-    /// Subscription accounts derived from `cards` and `served`.
+    @ObservationIgnored private let cache: SnapshotCache
+    @ObservationIgnored private var inflight: Task<Void, Never>?
+    @ObservationIgnored private var loadGen = 0
+
+    init(cache: SnapshotCache = .shared) {
+        self.cache = cache
+    }
+
     var accounts: [SubscriptionAccount] { SubscriptionAccounts.accounts(cards: cards, served: served) }
 
     /// The account with card id `id`.
@@ -89,12 +101,15 @@ final class QuotasStore {
     /// Cards have been read at least once.
     var hasData: Bool { lastRead != nil }
 
-    /// The last read failed for want of a connection (shown as 连不上).
-    var isOffline: Bool {
-        if staleSince != nil { return true }
-        if case .failed(let error) = phase { return error != .forbidden && error != .unauthorized }
-        return false
-    }
+    /// The computer didn't answer (连不上): OfflineCard, data dimmed.
+    var isOffline: Bool { freshness.isUnreachable }
+
+    /// A card's own 「这张没读到最新的」 footer: hidden while 连不上
+    ///.
+    func staleFooter(for id: String) -> Date? { isOffline ? nil : cardStale[id] }
+
+    /// The computer answered but the cards didn't come: the banner.
+    var isStale: Bool { freshness.isStale && hasData }
 
     /// Whether this 密钥 may read 额度: nil until magpie has answered.
     var canRead: Bool? {
@@ -105,53 +120,179 @@ final class QuotasStore {
         }
     }
 
-    /// Pull to refresh, first load and foreground re-reads.
-    func load(_ client: QuotaClient?, extras: MagpieClient? = nil) async {
+    /// The computer the data is for: switching clears memory, then shows
+    /// that computer's saved answers. Idempotent.
+    func use(_ computer: String?) {
+        guard computer != computerID else { return }
         #if DEBUG
-        if let demo = DemoData.quotaCards() {
-            switch DemoData.state {
-            case "loading":
-                phase = .loading
-                return
-            case "empty":
-                apply([])
-                return
-            default: break
-            }
-            apply(demo)
-            if DemoData.state == "offline" {
-                staleSince = lastRead
-                phase = .loaded
-            }
-            served = DemoData.servedCards()
-            usageWeek = DemoData.usageSummary(.sevenDays)
-            usageToday = DemoData.usageSummary(.today)
-            history = DemoData.history()
+        // Demo data isn't per computer; a reset here would blank it.
+        if DemoData.isOn { computerID = computer; return }
+        #endif
+        reset()
+        computerID = computer
+        restore()
+    }
+
+    /// Pull to refresh, first load and foreground re-reads. One load at a
+    /// time: a second call waits for the one running.
+    func load(_ client: QuotaClient?, extras: MagpieClient? = nil, computer: String? = nil) async {
+        #if DEBUG
+        if DemoData.isOn {
+            loadDemo()
             return
         }
         #endif
-        if let extras {
-            // 1.4: history feeds the cards' run-out line too.
-            if let h = try? await extras.quotaHistory() { history = h } else if history == nil { history = .empty }
-            // Each is optional: a held key gets 403 on /usage, an older
-            // magpie may not have /quotas' serving times.
-            if let s = try? await extras.quotas() { served = s }
-            if let u = try? await extras.usage(.sevenDays) { usageWeek = u }
-            if let u = try? await extras.usage(.today) { usageToday = u }
-        }
+        if let computer { use(computer) }
         guard let client else { return }
+        if let inflight {
+            await inflight.value
+            return
+        }
+        loadGen += 1
+        let mine = loadGen
+        let task = Task { await self.run(client, extras: extras, mine: mine) }
+        inflight = task
+        await task.value
+        if mine == loadGen { inflight = nil }
+    }
+
+    private enum Part: Sendable {
+        case cards(Result<Fetched<[QuotaCard]>, QuotaError>)
+        case served(Result<Fetched<[QuotaCard]>, MagpieAPIError>)
+        case history(Result<Fetched<QuotaHistory>, MagpieAPIError>)
+        case usage(UsagePeriod, Result<Fetched<UsageSummary>, MagpieAPIError>)
+    }
+
+    /// Cards first, applied at once; then history, `/quotas?kept=1` and
+    /// both usage reads together, each applied as it lands. 12 s at most.
+    private func run(_ client: QuotaClient, extras: MagpieClient?, mine: Int) async {
+        freshness.begin()
         if !hasData { phase = .loading }
-        do {
-            let fresh = try await client.cards()
-            apply(fresh)
-        } catch {
-            if hasData {
-                staleSince = lastRead
-                phase = .loaded
-            } else {
-                phase = .failed(error)
+        let watch = LoadWatch(probe: extras) { [weak self] stage in
+            guard let self, self.loadGen == mine else { return false }
+            return self.freshness.mark(stage)
+        }
+        defer { watch.stop() }
+        var answered = false
+        var mainError: QuotaError?
+
+        let land: (Part) -> Void = { [self] part in
+            guard mine == loadGen else { return }
+            switch part {
+            case .cards(.success(let f)):
+                answered = true
+                applyCards(f.value)
+                save(f.data, "cards", QuotaClient.cardsPath)
+            case .cards(.failure(let e)):
+                mainError = e
+            case .served(.success(let f)):
+                answered = true
+                served = f.value
+                save(f.data, "served", "/v1/magpie/quotas?kept=1")
+            case .history(.success(let f)):
+                answered = true
+                history = f.value
+                save(f.data, "history", "/v1/magpie/quotas/history")
+            case .history(.failure):
+                if history == nil { history = .empty }
+            case .usage(let period, .success(let f)):
+                answered = true
+                if period == .today { usageToday = f.value } else { usageWeek = f.value }
+                save(f.data, "usage-" + period.rawValue, "/v1/magpie/usage?period=" + period.rawValue)
+            case .served(.failure), .usage(_, .failure):
+                // Optional: a held key gets 403 on /usage; old data stays.
+                break
             }
         }
+
+        let cut = await Together.run(until: watch.deadline, [{ .cards(await Fetch.run { try await client.cardsWithData() }) }], land: land)
+        if cut { mainError = .timeout }
+        if let extras, mine == loadGen, mainError.map({ ReadTrouble($0) != .connection && ReadTrouble($0) != .denied }) ?? true {
+            _ = await Together.run(until: watch.deadline, [
+                { .history(await Fetch.run { try await extras.quotaHistoryWithData() }) },
+                { .served(await Fetch.run { try await extras.quotasWithData(kept: true) }) },
+                { .usage(.sevenDays, await Fetch.run { try await extras.usageWithData(.sevenDays) }) },
+                { .usage(.today, await Fetch.run { try await extras.usageWithData(.today) }) },
+            ], land: land)
+        }
+        guard mine == loadGen else { return }
+        guard let mainError else {
+            freshness.end(nil)
+            return
+        }
+        let trouble = ReadTrouble(mainError)
+        if trouble == .denied {
+            // A permission state, not a network one: what this key may not see goes.
+            cards = []
+            cardStale = [:]
+            freshness = Freshness()
+            fromCache = false
+            phase = .failed(mainError)
+            return
+        }
+        let failure = await watch.failure(trouble: trouble, answered: answered)
+        guard mine == loadGen else { return }
+        phase = hasData ? .loaded : .failed(mainError)
+        freshness.end(failure)
+    }
+
+    #if DEBUG
+    /// `-perch-demo`: made-up cards; `PERCH_DEMO_STATE` picks the state
+    /// (calm, empty, loading, offline, stale, refreshing, slow, partial).
+    private func loadDemo() {
+        guard let demo = DemoData.quotaCards() else { return }
+        switch DemoData.state {
+        case "loading":
+            phase = .loading
+            return
+        case "empty":
+            applyCards([])
+            return
+        default: break
+        }
+        applyCards(demo)
+        served = DemoData.servedCards()
+        usageWeek = DemoData.usageSummary(.sevenDays)
+        usageToday = DemoData.usageSummary(.today)
+        history = DemoData.history()
+        let earlier = Date.now.addingTimeInterval(-26 * 60)
+        switch DemoData.state {
+        case "offline":
+            freshness.lastRead = earlier
+            freshness.end(.unreachable)
+        case "stale":
+            freshness.lastRead = earlier
+            freshness.end(.stale)
+        case "refreshing", "slow":
+            freshness.lastRead = Date.now.addingTimeInterval(-3 * 60)
+            freshness.begin()
+            _ = freshness.mark(DemoData.state == "slow" ? .slow : .show)
+        case "partial":
+            if let card = cards.first(where: { $0.kind == "subscription" }) { cardStale[card.id] = earlier }
+        default: break
+        }
+    }
+    #endif
+
+    /// The saved answers of `computerID`, decoded like live ones.
+    private func restore() {
+        #if DEBUG
+        if DemoData.isOn { return }
+        #endif
+        guard let id = computerID else { return }
+        if let e = cache.load(computer: id, name: "cards"), let cards = try? QuotaDecoding.cards(from: e.body) {
+            applyCards(cards, at: e.savedAt)
+            fromCache = true
+        }
+        if let e = cache.load(computer: id, name: "served"), let s = try? QuotaDecoding.cards(from: e.body) { served = s }
+        if let e = cache.load(computer: id, name: "history") { history = QuotaHistoryDecoding.history(from: e.body) }
+        if let e = cache.load(computer: id, name: "usage-7d") { usageWeek = UsageDecoding.summary(from: e.body) }
+        if let e = cache.load(computer: id, name: "usage-today") { usageToday = UsageDecoding.summary(from: e.body) }
+    }
+
+    private func save(_ data: Data, _ name: String, _ endpoint: String) {
+        guard let computerID else { return }
+        cache.save(data, computer: computerID, name: name, endpoint: endpoint)
     }
 
     /// Seconds left before this card may be refreshed again, else nil.
@@ -163,8 +304,9 @@ final class QuotasStore {
 
     /// Per-card refresh. Returns false when the card is still cooling down.
     @discardableResult
-    func refresh(_ card: QuotaCard, client: QuotaClient?) async -> Bool {
-        if cooldownLeft(card) != nil { return false }
+    /// `force`: the footer's retry after a failed read (no 30 s wait).
+    func refresh(_ card: QuotaCard, client: QuotaClient?, force: Bool = false) async -> Bool {
+        if !force, cooldownLeft(card) != nil { return false }
         #if DEBUG
         if DemoData.isOn {
             lastCardRefresh[card.id] = .now
@@ -178,12 +320,16 @@ final class QuotasStore {
         do {
             let fresh = try await client.refresh(card)
             if fresh.isEmpty {
-                apply(try await client.cards())
+                let f = try await client.cardsWithData()
+                applyCards(f.value)
+                save(f.data, "cards", QuotaClient.cardsPath)
             } else {
-                apply(fresh)
+                applyCards(fresh)
             }
+            cardStale[card.id] = nil
         } catch {
-            staleSince = lastRead
+            // Only this card: its footer says so; the rest stays as it is.
+            cardStale[card.id] = lastRead ?? card.readAt ?? .now
         }
         return true
     }
@@ -194,7 +340,12 @@ final class QuotasStore {
         if DemoData.isOn { history = DemoData.history(); return }
         #endif
         guard let client else { return }
-        if let h = try? await client.quotaHistory() { history = h } else if history == nil { history = .empty }
+        if let h = try? await client.quotaHistoryWithData() {
+            history = h.value
+            save(h.data, "history", "/v1/magpie/quotas/history")
+        } else if history == nil {
+            history = .empty
+        }
     }
 
     /// 停用 / 启用 an account. magpie's answer isn't the cards, so they
@@ -218,12 +369,22 @@ final class QuotasStore {
         }
         offOverrides[account.id] = !on
         if let i = cards.firstIndex(where: { $0.id == account.id }) { cards[i].off = !on }
-        if let cardClient, let fresh = try? await cardClient.cards() { apply(fresh) }
+        if let cardClient, let f = try? await cardClient.cardsWithData() {
+            applyCards(f.value)
+            save(f.data, "cards", QuotaClient.cardsPath)
+        }
         return .success(())
     }
 
-    /// Forgets everything (on disconnect or switching computers).
+    /// Memory only (disconnect, 换一台电脑); the disk cache stays.
     func reset() {
+        inflight?.cancel()
+        inflight = nil
+        loadGen += 1
+        computerID = nil
+        freshness = Freshness()
+        fromCache = false
+        cardStale = [:]
         served = []
         usageWeek = nil
         usageToday = nil
@@ -233,15 +394,13 @@ final class QuotasStore {
         offOverrides = [:]
         cards = []
         phase = .idle
-        lastRead = nil
-        staleSince = nil
         refreshing = []
         lastCardRefresh = [:]
     }
 
     /// Adopts freshly read cards, keeping on/off overrides until magpie
     /// agrees, and clears any stale/failed state.
-    private func apply(_ fresh: [QuotaCard]) {
+    private func applyCards(_ fresh: [QuotaCard], at date: Date = .now) {
         // magpie's order; the view sorts by the user's 排序 choice.
         var fresh = fresh
         for i in fresh.indices {
@@ -249,9 +408,10 @@ final class QuotasStore {
             if fresh[i].off == off { offOverrides[fresh[i].id] = nil } else { fresh[i].off = off }
         }
         cards = fresh
-        record(fresh, at: .now)
-        lastRead = .now
-        staleSince = nil
+        record(fresh, at: date)
+        freshness.succeed(at: date)
+        fromCache = false
+        cardStale = [:]
         phase = .loaded
     }
 

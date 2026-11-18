@@ -12,7 +12,7 @@ struct QuotasView: View {
     @AppStorage(QuotaSort.storageKey) private var sort: QuotaSort = .mostUsed
     @State private var toast: String?
     @State private var now = Date.now
-    @State private var refreshed = 0
+    @State private var pull = PullOutcome()
     @Namespace private var zoom
 
     var body: some View {
@@ -20,22 +20,14 @@ struct QuotasView: View {
             content
                 .perchScreen()
                 .navigationTitle("额度")
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        StatusCapsule(
-                            computer: connection.computerName ?? "",
-                            ago: store.lastRead.map { QuotaFormat.ago($0, now: now) },
-                            offline: store.isOffline
-                        )
-                    }
-                    .plainBackground()
-                }
+                .statusCapsule(computer: connection.computerName ?? "", freshness: store.freshness)
                 .refreshable {
                     await load()
-                    refreshed += 1
-                    store.breath += 1
+                    let ok = store.freshness.failure == nil && store.phase == .loaded
+                    pull.record(ok)
+                    if ok { store.breath += 1 }
                 }
-                .sensoryFeedback(Haptic.refreshed, trigger: refreshed)
+                .pullFeedback(pull)
                 .sensoryFeedback(Haptic.runOut, trigger: runOutKey) { old, new in new != nil && old != new }
                 .toast($toast, seconds: 2)
                 .navigationDestination(for: AccountRoute.self) { route in
@@ -72,7 +64,7 @@ struct QuotasView: View {
     /// Loads the cards and records whether the computer answered.
     private func load() async {
         let id = connection.currentID
-        await store.load(connection.quotaClient(), extras: connection.magpieClient())
+        await store.load(connection.quotaClient(), extras: connection.magpieClient(), computer: id)
         if let id, id == connection.currentID, store.phase != .idle { connection.markReachable(id, !store.isOffline) }
     }
 
@@ -112,8 +104,19 @@ struct QuotasView: View {
         default:
             if store.cards.isEmpty {
                 ScrollView {
+                    if store.isOffline {
+                        OfflineCard(computer: connection.computerName ?? "", since: store.lastRead, now: now) {
+                            Task { await load() }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 4)
+                    } else if store.isStale, let since = store.lastRead {
+                        StaleBanner(since: since, now: now) { Task { await load() } }
+                            .padding(.horizontal, 16)
+                            .padding(.top, 4)
+                    }
                     ArtStateView(title: String(localized: "还没有额度可看"),
-                                 message: String(localized: "magpie 里还没有订阅账号，或者这把密钥没打开「可看额度」。"),
+                                 message: String(localized: "magpie 里还没有订阅账号。"),
                                  button: String(localized: "刷新")) {
                         Task { await load() }
                     }
@@ -134,27 +137,16 @@ struct QuotasView: View {
                         Task { await load() }
                     }
                     .padding(.bottom, 12)
-                    .transition(.opacity)
+                    .transition(.offlineCard)
+                }
+                if store.isStale, let since = store.lastRead {
+                    StaleBanner(since: since, now: now) { Task { await load() } }
+                        .padding(.bottom, 12)
+                        .transition(.staleBanner)
                 }
                 if versions.showsBanner, let release = versions.newer {
                     VersionBanner(computer: connection.computerName ?? "", release: release)
                         .padding(.bottom, 12)
-                }
-                if let stale = store.staleSince, !store.isOffline {
-                    Label {
-                        Text("没读到最新的，下面是 \(QuotaFormat.clock(stale, now: now)) 的数据。")
-                            .font(.subheadline)
-                            .foregroundStyle(.ink)
-                    } icon: {
-                        Image(systemName: "clock.arrow.circlepath")
-                            .foregroundStyle(.warn)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
-                    .perchCard()
-                    .padding(.bottom, 12)
-                    .accessibilityIdentifier("quotas-stale")
                 }
 
                 Group {
@@ -193,12 +185,13 @@ struct QuotasView: View {
                     footer
                 }
                 .offlineDimmed(store.isOffline)
-                .animation(.easeInOut(duration: 0.6), value: store.isOffline)
+                .environment(\.fromCache, store.fromCache)
             }
             .padding(.horizontal, 16)
             .padding(.top, 4)
             .padding(.bottom, 24)
-            .animation(Motion.calm(reduce), value: store.isOffline)
+            .animation(Motion.offline(reduce, showing: store.isOffline), value: store.isOffline)
+            .animation(Motion.banner(reduce, showing: store.isStale), value: store.isStale)
         }
     }
 
@@ -254,11 +247,6 @@ struct QuotasView: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("下拉刷新全部，长按一张卡只刷新这一张。")
-            if let read = store.lastRead {
-                Text("\(QuotaFormat.ago(read, now: now)) 读取")
-                    .monospacedDigit()
-                    .accessibilityIdentifier("quotas-read-time")
-            }
         }
         .font(.footnote)
         .foregroundStyle(.ink2)
@@ -296,6 +284,8 @@ struct QuotaCardView: View {
     @State private var pressed = false
 
     private var hasError: Bool { card.error?.trimmed.isEmpty == false }
+    /// This card's own refresh failed; when its data was read.
+    private var staleSince: Date? { store.staleFooter(for: card.id) }
     /// 1.4 「照现在的速度，大约 %@ 用完」: one line per card, the window that
     /// runs out first.
     private var runOut: RunOut? {
@@ -316,6 +306,7 @@ struct QuotaCardView: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(Text(verbatim: spoken))
             .accessibilityAction(named: Text("刷新这张额度")) { refresh() }
+            .accessibilityAction(named: Text("重试")) { if staleSince != nil { retryCard() } }
             .accessibilityHint(opens ? Text("打开详情") : Text(verbatim: ""))
             .accessibilityIdentifier("quota-card")
     }
@@ -361,6 +352,10 @@ struct QuotaCardView: View {
                         .foregroundStyle(.warn)
                 }
             }
+            if let staleSince {
+                StaleFooter(since: staleSince, now: now) { retryCard() }
+                    .highPriorityGesture(TapGesture().onEnded { retryCard() })
+            }
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -381,6 +376,11 @@ struct QuotaCardView: View {
         case 2: [GridItem(.flexible(), spacing: 16, alignment: .top), GridItem(.flexible(), alignment: .top)]
         default: Array(repeating: GridItem(.flexible(), spacing: 12, alignment: .top), count: 3)
         }
+    }
+
+    /// The footer's tap: read this card again (no 30 s wait; it failed).
+    private func retryCard() {
+        Task { await store.refresh(card, client: connection.quotaClient(), force: true) }
     }
 
     /// Asks magpie to re-read this card, unless it was refreshed moments ago.
@@ -458,6 +458,7 @@ struct QuotaCardView: View {
         if let error = card.error?.trimmed, !error.isEmpty, !card.loginExpired { parts.append(String(localized: "读不到：\(error)")) }
         var text = head.joined(separator: "，") + "。" + parts.joined(separator: "；")
         if let runOut { text += "。" + runOut.text(now: now) }
+        if let staleSince { text += "。" + FreshnessText.cardFooter(staleSince, now: now) }
         return text
     }
 }
@@ -539,6 +540,7 @@ struct QuotaBar: View {
     let used: Double
 
     @Environment(\.accessibilityReduceMotion) private var reduce
+    @Environment(\.fromCache) private var fromCache
     @State private var grown = false
 
     var body: some View {
@@ -555,6 +557,7 @@ struct QuotaBar: View {
         .animation(Motion.calm(reduce), value: used)
         .onAppear {
             guard !grown else { return }
+            if fromCache { grown = true; return }
             if let grow = Motion.grow(reduce) { withAnimation(grow) { grown = true } } else { grown = true }
         }
         .accessibilityHidden(true)

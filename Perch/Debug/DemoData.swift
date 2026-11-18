@@ -296,7 +296,9 @@ enum DemoData {
           {"id":"coder","name":"Coder","routing":"order","members":["alpha/m-alpha","beta/m-beta","gamma/m-gamma"]},
           {"id":"fast","name":"fast","routing":"manual","pick":"kimi/kimi-k3","members":["kimi/kimi-k3","glm/glm-5.3","deepseek/deepseek-v4-pro"]},
           {"id":"cheap","name":"cheap","routing":"cheap","members":["deepseek/deepseek-v4-pro","glm/glm-5.3"]},
-          {"id":"claude-opus-5-5","name":"claude-opus-5-5","routing":"","members":["claude/claude-opus-5-5","copilot/claude-opus-5-5"]}
+          {"id":"claude-opus-5-5","name":"claude-opus-5-5","routing":"","members":["claude/claude-opus-5-5","copilot/claude-opus-5-5"]},
+          {"id":"night","name":"night","routing":"order","disabled":true,"members":["glm/glm-5.3","kimi/kimi-k3"]},
+          {"id":"auto-m-alpha","name":"m-alpha","auto":true,"hidden":true,"ref":"auto/m-alpha","members":["alpha/m-alpha","beta/m-alpha"]}
         ]}
         """
         return (try? RoutingDecoding.groups(from: Data(json.utf8))) ?? []

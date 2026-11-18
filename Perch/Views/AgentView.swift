@@ -17,10 +17,12 @@ struct AgentView: View {
     @Environment(QuotasStore.self) private var quotas
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.accessibilityReduceMotion) private var reduce
 
     @State private var path = NavigationPath()
     @State private var now = Date.now
     @State private var live = LiveStore()
+    @State private var pull = PullOutcome()
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -33,16 +35,13 @@ struct AgentView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1) }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        StatusCapsule(
-                            computer: connection.computerName ?? "",
-                            ago: usage.lastRead.map { QuotaFormat.ago($0, now: now) },
-                            offline: usage.isOffline
-                        )
-                    }
-                    .plainBackground()
                 }
-                .refreshable { await reload() }
+                .statusCapsule(computer: connection.computerName ?? "", freshness: usage.freshness)
+                .refreshable {
+                    await reload()
+                    pull.record(usage.freshness.failure == nil && usage.phase == .loaded)
+                }
+                .pullFeedback(pull)
                 .navigationDestination(for: AgentRoute.self) { route in
                     switch route {
                     case .all(let account, let failedOnly): AllCallsView(account: account, failedOnly: failedOnly)
@@ -80,10 +79,10 @@ struct AgentView: View {
     private func reload() async {
         now = .now
         let id = connection.currentID
-        await usage.load(connection.magpieClient())
+        await usage.load(connection.magpieClient(), computer: id)
         if let id, id == connection.currentID, usage.phase != .idle { connection.markReachable(id, !usage.isOffline) }
         if quotas.cards.isEmpty {
-            await quotas.load(connection.quotaClient(), extras: connection.magpieClient())
+            await quotas.load(connection.quotaClient(), extras: connection.magpieClient(), computer: id)
         }
     }
 
@@ -125,13 +124,14 @@ struct AgentView: View {
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(verbatim: usage.agentName)
-                    .font(.largeTitle.bold())
-                    .foregroundStyle(.primary)
+                    .font(.system(.largeTitle, design: .serif, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundStyle(.ink)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.tint)
+                    .foregroundStyle(Color.accentColor)
             }
             .contentShape(.rect)
         }
@@ -160,37 +160,41 @@ struct AgentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 titleMenu
-                Picker("时间段", selection: $usage.period) {
-                    Text("今天").tag(UsagePeriod.today)
-                    Text("7 天").tag(UsagePeriod.sevenDays)
-                    Text("30 天").tag(UsagePeriod.thirtyDays)
-                }
-                .pickerStyle(.segmented)
+                PerchSegmented(selection: $usage.period, options: [
+                    .init(value: .today, title: "今天", id: "period-today"),
+                    .init(value: .sevenDays, title: "7 天", id: "period-7d"),
+                    .init(value: .thirtyDays, title: "30 天", id: "period-30d"),
+                ])
+                .accessibilityLabel(Text("时间段"))
                 .accessibilityIdentifier("agent-period")
 
-                if usage.isOffline, connection.computers.count > 1 {
-                    UnreachableBar()
-                }
-
-                if let stale = usage.staleSince {
-                    Label {
-                        Text("没读到最新的用量，下面是 \(QuotaFormat.clock(stale, now: now)) 的数据。")
-                            .font(.subheadline)
-                    } icon: {
-                        Image(systemName: "wifi.exclamationmark").foregroundStyle(.orange)
+                // One child, spacing inside the collapsing views, so
+                // the content below rides up with them and never jumps.
+                VStack(alignment: .leading, spacing: 0) {
+                    if usage.isOffline {
+                        OfflineCard(computer: connection.computerName ?? "", since: usage.hasData ? usage.lastRead : nil, now: now) {
+                            Task { await reload() }
+                        }
+                        .padding(.bottom, 18)
+                        .transition(.offlineCard)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
-                    .background(Color.card, in: .rect(cornerRadius: 18))
-                    .accessibilityIdentifier("agent-stale")
-                }
 
-                state
+                    if usage.isStale, let since = usage.lastRead {
+                        StaleBanner(since: since, now: now) { Task { await reload() } }
+                            .padding(.bottom, 18)
+                            .transition(.staleBanner)
+                    }
+
+                    state
+                        .offlineDimmed(usage.isOffline && usage.hasData)
+                        .environment(\.fromCache, usage.fromCache)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 4)
             .padding(.bottom, 24)
+            .animation(Motion.offline(reduce, showing: usage.isOffline), value: usage.isOffline)
+            .animation(Motion.banner(reduce, showing: usage.isStale), value: usage.isStale)
         }
     }
 
@@ -198,24 +202,18 @@ struct AgentView: View {
     private var state: some View {
         switch usage.phase {
         case .failed(.held):
-            ContentUnavailableView {
-                Label("看不到用量", systemImage: "lock")
-            } description: {
-                Text(verbatim: MagpieAPIError.held.message)
-            } actions: {
-                Button("去设置") { openSettings() }
-                    .buttonStyle(.borderedProminent)
-            }
-            .padding(.top, 40)
-            .accessibilityIdentifier("agent-held")
+            ArtStateView(art: "art-error", title: String(localized: "看不到用量"), message: MagpieAPIError.held.message,
+                         button: String(localized: "去设置")) { openSettings() }
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("agent-held")
+        case .failed where !usage.hasData && usage.isOffline:
+            // The offline card above says it all.
+            EmptyView()
         case .failed(let error) where !usage.hasData:
-            ContentUnavailableView {
-                Label { Text(verbatim: error.message) } icon: { Image(systemName: "wifi.exclamationmark") }
-            } actions: {
-                Button("再刷新一次") { Task { await reload() } }
-                    .buttonStyle(.borderedProminent)
+            ArtStateView(art: "art-error", title: error.message, button: String(localized: "刷新")) {
+                Task { await reload() }
             }
-            .padding(.top, 40)
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier("agent-failed")
         default:
             if let page = usage.page {
@@ -225,37 +223,35 @@ struct AgentView: View {
                     overview(page)
                 }
             } else {
-                placeholder
+                AgentSkeleton()
             }
         }
     }
 
+    /// Nobody has come yet, or this agent was quiet this period.
     @ViewBuilder
     private var empty: some View {
         let nobody = usage.agents.isEmpty && (usage.summary?.totals.calls ?? 0) == 0
-        ContentUnavailableView {
-            Label {
-                if nobody { Text("还没有 Agent 通过 magpie 调用过模型。") } else { Text("这段时间 \(usage.agentName) 没有调用") }
-            } icon: {
-                Image(systemName: "apple.terminal")
+        Group {
+            if nobody {
+                ArtStateView(title: String(localized: "还没有 Agent 来过"),
+                             message: String(localized: "让 Claude Code 这类 Agent 通过 magpie 调用模型，这里就会记下来。"))
+            } else {
+                ArtStateView(title: String(localized: "这段时间很安静"),
+                             message: String(localized: "\(Self.periodWord(usage.period)) \(usage.agentName) 还没有调用。用起来，这里就有数了。"))
             }
-        } description: {
-            if !nobody { Text("让 \(usage.agentName) 通过 magpie 调用模型，这里就会有数据。") }
         }
-        .padding(.top, 40)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("agent-empty")
     }
 
-    private var placeholder: some View {
-        VStack(spacing: 18) {
-            Tiles(totals: UsageTotals(calls: 10, input: 1000, output: 100, cost: 1))
-            RoundedRectangle(cornerRadius: 18).fill(Color.card).frame(height: 120)
-            ForEach(0..<3, id: \.self) { _ in
-                RoundedRectangle(cornerRadius: 12).fill(Color.card).frame(height: 56)
-            }
+    /// 今天 / 这 7 天 / 这 30 天.
+    static func periodWord(_ period: UsagePeriod) -> String {
+        switch period {
+        case .today: String(localized: "今天")
+        case .sevenDays: String(localized: "这 7 天")
+        default: String(localized: "这 30 天")
         }
-        .redacted(reason: .placeholder)
-        .accessibilityHidden(true)
     }
 
     /// The summary line, tiles, chart and model/account splits for a page.
@@ -265,18 +261,23 @@ struct AgentView: View {
                 SummaryLine(summary: summary) {
                     path.append(AgentRoute.all(account: nil, failedOnly: true))
                 }
+                .riseIn(0)
             }
 
             if live.state != .hidden {
                 LiveCard(state: live.state, now: now, cards: quotas.cards) { row in
                     path.append(AgentRoute.call(row))
                 }
+                .transition(.opacity)
+                .riseIn(1)
             }
 
             Tiles(totals: page.totals)
+                .riseIn(2)
 
             if !page.series.isEmpty {
                 CostChart(series: page.series, period: usage.period, now: now)
+                    .riseIn(3)
             }
 
             if !page.byModel.isEmpty {
@@ -286,66 +287,69 @@ struct AgentView: View {
                     }
                     let total = max(1, page.totals.tokens)
                     ForEach(Array(models.enumerated()), id: \.element.id) { i, m in
-                        if i > 0 { Divider() }
+                        if i > 0 { Divider().overlay(Color.hairline) }
                         ModelRow(bucket: m, share: Double(m.totals.tokens) / Double(total))
                     }
                 }
             }
 
             if !usage.accounts.isEmpty || usage.otherAccountTotals != nil {
-                block(Text("按账号")) {
+                block(Text("按账号"), staleSince: usage.accountsFooter) {
                     ForEach(Array(usage.accounts.enumerated()), id: \.element.id) { i, a in
-                        if i > 0 { Divider() }
+                        if i > 0 { Divider().overlay(Color.hairline) }
                         accountRow(a)
                     }
                     if let other = usage.otherAccountTotals {
-                        if !usage.accounts.isEmpty { Divider() }
+                        if !usage.accounts.isEmpty { Divider().overlay(Color.hairline) }
                         AccountUsageRow(name: String(localized: "其他"), claude: false, totals: other, chevron: false)
                     }
                 }
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("最近的调用").font(.system(size: 13, weight: .semibold))
-                    Spacer()
+                BlockHeader(title: Text("最近的调用")) {
                     NavigationLink(value: AgentRoute.all(account: nil, failedOnly: false)) {
-                        Text("全部").font(.system(size: 13, weight: .medium)).frame(minHeight: 32)
+                        Text("全部").font(.subheadline.weight(.medium)).frame(minHeight: 32)
                     }
                     .accessibilityIdentifier("agent-all-calls")
                 }
-                .padding(.horizontal, 4)
                 VStack(spacing: 0) {
                     ForEach(Array(page.rows.prefix(5).enumerated()), id: \.element.id) { i, row in
-                        if i > 0 { Divider().padding(.leading, 14) }
+                        if i > 0 { Divider().overlay(Color.hairline).padding(.leading, 16) }
                         NavigationLink(value: AgentRoute.call(row)) {
                             CallRow(row: row, now: now, accountName: accountName(row.account), cards: quotas.cards)
-                                .padding(.horizontal, 14)
+                                .padding(.horizontal, 16)
                         }
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("agent-call-row")
                     }
                 }
-                .background(Color.card, in: .rect(cornerRadius: 18))
+                .padding(.vertical, 2)
+                .perchCard()
             }
 
             Text("按 API 价格估算，订阅本身不额外收费。")
                 .font(.footnote)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.ink2)
                 .padding(.horizontal, 4)
                 .accessibilityIdentifier("agent-cost-footer")
         }
     }
 
     /// A titled group of rows on a card.
-    private func block<C: View>(_ title: Text, @ViewBuilder _ rows: () -> C) -> some View {
+    private func block<C: View>(_ title: Text, staleSince: Date? = nil, @ViewBuilder _ rows: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            title.font(.system(size: 13, weight: .semibold)).padding(.horizontal, 4)
-                .accessibilityAddTraits(.isHeader)
-            VStack(alignment: .leading, spacing: 10) { rows() }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
-                .background(Color.card, in: .rect(cornerRadius: 18))
+            BlockHeader(title)
+            VStack(alignment: .leading, spacing: 12) {
+                rows()
+                if let staleSince {
+                    StaleFooter(since: staleSince, now: now) { Task { await reload() } }
+                }
+            }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .perchCard()
         }
     }
 
@@ -386,10 +390,12 @@ private struct Tiles: View {
         Grid(horizontalSpacing: 8) {
             GridRow {
                 AgentTile(label: String(localized: "调用"), value: totals.calls.text,
-                          source: totals.errors > 0 ? String(localized: "失败 \(totals.errors.text) 次") : nil, sourceColor: .red)
+                          source: totals.errors > 0 ? String(localized: "失败 \(totals.errors.text) 次") : nil, sourceColor: .bad)
                     .accessibilityIdentifier("agent-tile-calls")
                 AgentTile(label: "token", value: UsageFormat.tokens(totals.tokens),
-                          source: String(localized: "输入 \(UsageFormat.tokens(totals.input)) · 输出 \(UsageFormat.tokens(totals.output))")
+                          // One pair per line: a narrow tile (SE) broke 「输出」 from its number.
+                          source: String(localized: "输入 \(UsageFormat.tokens(totals.input))")
+                            + "\n" + String(localized: "输出 \(UsageFormat.tokens(totals.output))")
                             + "\n" + String(localized: "缓存 \(UsageFormat.tokens(totals.cacheRead + totals.cacheWrite))"))
                     .accessibilityIdentifier("agent-tile-tokens")
                 AgentTile(label: String(localized: "费用"), value: UsageFormat.cost(totals), source: costSource)
@@ -404,17 +410,23 @@ private struct AgentTile: View {
     let label: String
     let value: String
     let source: String?
-    var sourceColor: Color = .secondary
+    var sourceColor: Color = .ink2
+    @Environment(\.accessibilityReduceMotion) private var reduce
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(verbatim: label).font(.system(size: 12)).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(verbatim: label).font(.footnote).foregroundStyle(.ink2)
+            // Value serif 24, numbers roll on change.
             Text(verbatim: value)
-                .font(.system(size: 22, weight: .bold).monospacedDigit())
+                .font(.system(size: 24, weight: .medium, design: .serif).monospacedDigit())
+                .foregroundStyle(.ink)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
+                .contentTransition(.numericText())
+                // Same animation as the summary sentence.
+                .animation(Motion.calm(reduce), value: value)
             Text(verbatim: source ?? " ")
-                .font(.system(size: 11))
+                .font(.caption2)
                 .foregroundStyle(sourceColor)
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
@@ -422,8 +434,8 @@ private struct AgentTile: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(Color.card, in: .rect(cornerRadius: 18))
+        .padding(.vertical, 12)
+        .perchCard(radius: 18)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(verbatim: label))
         .accessibilityValue(Text(verbatim: [value, source].compactMap { $0 }.joined(separator: "，")))
@@ -439,26 +451,47 @@ private struct ModelRow: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline) {
                 Text(verbatim: bucket.name.isEmpty ? bucket.id : bucket.name)
-                    .font(.system(size: 14).monospaced())
+                    .font(.subheadline.monospaced())
+                    .foregroundStyle(.ink)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
                 Text(verbatim: UsageFormat.cost(bucket.totals))
                     .font(.system(size: 15, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.ink)
+                    .contentTransition(.numericText())
             }
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.track)
-                    Capsule().fill(Color.primary).frame(width: geo.size.width * min(max(share, 0), 1))
-                }
-            }
-            .frame(height: 4)
+            ShareBar(share: share)
             Text("\(bucket.totals.calls.text) 次 · \(UsageFormat.tokens(bucket.totals.tokens)) token")
-                .font(.system(size: 12).monospacedDigit())
-                .foregroundStyle(.secondary)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.ink2)
         }
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("agent-model-row")
+    }
+}
+
+/// A 6 pt bar (radius 3) of ink on track that grows from the leading
+/// edge on first appear.
+private struct ShareBar: View {
+    let share: Double
+    @Environment(\.accessibilityReduceMotion) private var reduce
+    @State private var grown = false
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 3).fill(Color.track)
+                RoundedRectangle(cornerRadius: 3).fill(Color.ink)
+                    .frame(width: geo.size.width * min(max(share, 0), 1))
+                    .scaleEffect(x: grown ? 1 : 0, anchor: .leading)
+            }
+        }
+        .frame(height: 6)
+        .animation(Motion.calm(reduce), value: share)
+        .onAppear {
+            if let grow = Motion.grow(reduce) { withAnimation(grow) { grown = true } } else { grown = true }
+        }
     }
 }
 
@@ -473,18 +506,19 @@ private struct AccountUsageRow: View {
         HStack(spacing: 10) {
             Monogram(text: name, claude: claude)
             VStack(alignment: .leading, spacing: 1) {
-                Text(verbatim: name).font(.system(size: 17)).lineLimit(1)
+                Text(verbatim: name).font(.body).foregroundStyle(.ink).lineLimit(1)
                 Text("\(totals.calls.text) 次 · \(UsageFormat.tokens(totals.tokens)) token")
-                    .font(.system(size: 12).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.ink2)
             }
             Spacer(minLength: 4)
             Text(verbatim: UsageFormat.cost(totals))
                 .font(.system(size: 15, weight: .semibold).monospacedDigit())
+                .foregroundStyle(.ink)
             if chevron {
                 Image(systemName: "chevron.right")
                     .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.ink2.opacity(0.6))
             }
         }
         .contentShape(.rect)
@@ -512,12 +546,13 @@ struct CallRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(verbatim: CallFailure.line(for: row, cards: cards, now: now))
                         .font(.system(size: 15))
+                        .foregroundStyle(.ink)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("call-human-line")
                     Text(verbatim: [row.shownModel, who, row.time.map { QuotaFormat.ago($0, now: now) }].compactMap { $0 }.joined(separator: " · "))
-                        .font(.system(size: 12).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.ink2)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
@@ -527,34 +562,34 @@ struct CallRow: View {
             } else {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 0) {
-                        Text(verbatim: row.shownModel).font(.system(size: 14).monospaced())
+                        Text(verbatim: row.shownModel).font(.subheadline.monospaced())
                         if let who { Text(verbatim: " · \(who)").font(.system(size: 15)) }
                     }
+                    .foregroundStyle(.ink)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     Text(verbatim: detail)
-                        .font(.system(size: 12).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.ink2)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 4)
                 if row.switched {
-                    Text("换到了 \(CallFailure.switchedTo(row, cards: cards))")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+                    Chip(text: "换到了 \(CallFailure.switchedTo(row, cards: cards))", color: .warn)
                         .lineLimit(1)
+                        .accessibilityElement(children: .combine)
                         .accessibilityIdentifier("call-switched")
                 }
             }
             if !row.failed, let t = row.time {
                 Text(verbatim: QuotaFormat.ago(t, now: now))
-                    .font(.system(size: 13).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.ink2)
             }
             if chevron {
                 Image(systemName: "chevron.right")
                     .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.ink2.opacity(0.6))
             }
         }
         .frame(minHeight: 56)
@@ -572,13 +607,7 @@ struct CallRow: View {
 /// The red 「失败」 tag on a failed call.
 private struct FailedChip: View {
     var body: some View {
-        Text("失败")
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(.red)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(Color.red.opacity(0.12), in: .capsule)
-            .fixedSize()
+        Chip(text: "失败", color: .bad)
             .accessibilityLabel(Text("失败"))
     }
 }
@@ -609,46 +638,91 @@ struct AllCallsView: View {
     private var hasMore: Bool { rows.count < total }
 
     var body: some View {
-        List {
-            chips
-                .listRowInsets(EdgeInsets())
-                .listRowSeparator(.hidden)
-            ForEach(shown) { row in
-                NavigationLink(value: AgentRoute.call(row)) {
-                    CallRow(row: row, now: now, accountName: row.account.map { QuotaGrouping.card(named: $0, in: quotas.cards)?.title ?? $0 },
-                            cards: quotas.cards, chevron: false)
-                }
-                .accessibilityIdentifier("all-call-row")
-                .onAppear {
-                    if row.id == shown.last?.id, hasMore { Task { await more() } }
-                }
-            }
-            Section {
-                if loading {
-                    HStack { Spacer(); ProgressView(); Spacer() }
-                } else if let error {
-                    Text(verbatim: error.message).foregroundStyle(.secondary)
-                } else if !hasMore {
-                    Group {
-                        if !shown.isEmpty { Text("没有更早的了") }
-                        else if filter.failedOnly { Text("这段时间没有失败的调用。") }
-                        else { Text("这段时间 \(usage.agentName) 没有调用") }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                chips
+                if !shown.isEmpty {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(shown.enumerated()), id: \.element.id) { i, row in
+                            if i > 0 { Divider().overlay(Color.hairline).padding(.leading, 16) }
+                            NavigationLink(value: AgentRoute.call(row)) {
+                                CallRow(row: row, now: now, accountName: row.account.map { QuotaGrouping.card(named: $0, in: quotas.cards)?.title ?? $0 },
+                                        cards: quotas.cards)
+                                    .padding(.horizontal, 16)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("all-call-row")
+                            .onAppear {
+                                if row.id == shown.last?.id, hasMore { Task { await more() } }
+                            }
+                        }
                     }
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                        .accessibilityIdentifier("all-calls-end")
+                    .padding(.vertical, 2)
+                    .perchCard()
+                    .padding(.horizontal, 16)
+                    .riseIn()
                 }
+                footer
+                    .padding(.horizontal, 16)
             }
-            .listRowBackground(Color.clear)
+            .padding(.bottom, 24)
         }
-        .listStyle(.plain)
         .perchScreen(sky: false)
         .navigationTitle("最近的调用")
         .navigationSubtitle(Text(verbatim: usage.agentName))
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await first() }
         .task(id: filterKey) { await first() }
+    }
+
+    /// Below the list: a skeleton while the first page loads, the error,
+    /// 「没有更早的了」, or the empty state of the filter.
+    @ViewBuilder
+    private var footer: some View {
+        if loading && shown.isEmpty {
+            DelayedLoading(spoken: String(localized: "正在读取用量")) {
+                VStack(alignment: .leading, spacing: 18) {
+                    ForEach(0..<6, id: \.self) { _ in
+                        VStack(alignment: .leading, spacing: 6) {
+                            SkeletonBlock(width: 220, height: 14)
+                            SkeletonBlock(width: 130, height: 10)
+                        }
+                    }
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .perchCard()
+            }
+        } else if loading {
+            ProgressView()
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+        } else if let error {
+            ArtStateView(art: "art-error", title: error.message, button: String(localized: "刷新")) {
+                Task { await first() }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("all-calls-error")
+        } else if !hasMore {
+            Group {
+                if !shown.isEmpty {
+                    Text("没有更早的了")
+                        .font(.footnote)
+                        .foregroundStyle(.ink2)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                } else if filter.failedOnly {
+                    ArtStateView(title: String(localized: "没有失败"), message: String(localized: "这段时间的调用都成功了。"), top: 24)
+                } else if filter.retriedOnly {
+                    ArtStateView(title: String(localized: "没换过账号"), message: String(localized: "这段时间 magpie 都用的是第一个选中的账号。"), top: 24)
+                } else {
+                    ArtStateView(title: String(localized: "这段时间很安静"),
+                                 message: String(localized: "\(AgentView.periodWord(usage.period)) \(usage.agentName) 还没有调用。用起来，这里就有数了。"), top: 24)
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("all-calls-end")
+        }
     }
 
     private var filterKey: String {
@@ -776,7 +850,7 @@ struct CallDetailView: View {
         List {
             Section {
                 HStack {
-                    Text("结果")
+                    Text("结果").foregroundStyle(.ink)
                     Spacer()
                     resultCapsule
                 }
@@ -786,22 +860,24 @@ struct CallDetailView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(verbatim: CallFailure.line(for: row, cards: quotas.cards))
                             .font(.system(size: 15))
+                            .foregroundStyle(.ink)
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("call-human-line")
                         if let original = CallFailure.original(row) {
                             Text("magpie 原话：\(original)")
-                                .font(.system(size: 12))
-                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                                .foregroundStyle(.ink2)
                                 .textSelection(.enabled)
                                 .accessibilityIdentifier("call-original")
                         }
                     }
                 } else if row.switched {
                     Text("换到了 \(CallFailure.switchedTo(row, cards: quotas.cards))")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
+                        .font(.footnote)
+                        .foregroundStyle(.ink2)
                 }
             }
+            .cardRow()
             Section {
                 if let t = row.time {
                     LabeledContent("时间") {
@@ -810,7 +886,7 @@ struct CallDetailView: View {
                     }
                 }
                 LabeledContent("模型") {
-                    Text(verbatim: modelText).font(.system(size: 14).monospaced()).multilineTextAlignment(.trailing)
+                    Text(verbatim: modelText).font(.subheadline.monospaced()).foregroundStyle(.ink).multilineTextAlignment(.trailing)
                 }
                 LabeledContent("账号") {
                     Text(verbatim: accountText)
@@ -823,17 +899,21 @@ struct CallDetailView: View {
                         .monospacedDigit()
                 }
             }
+            .cardRow()
             Section {
                 LabeledContent("输入") { Text(verbatim: row.input.formatted()).monospacedDigit() }
                 LabeledContent("输出") { Text(verbatim: row.output.formatted()).monospacedDigit() }
                 LabeledContent("缓存读") { Text(verbatim: row.cacheRead.formatted()).monospacedDigit() }
                 LabeledContent("缓存写") { Text(verbatim: row.cacheWrite.formatted()).monospacedDigit() }
             } header: {
-                Text(verbatim: "token")
+                Text(verbatim: "token").listHeaderStyle()
             } footer: {
-                Text("magpie 不记录对话内容，这里只有这些数字。")
+                Text("magpie 不记录对话内容，这里只有这些数字。").foregroundStyle(.ink2)
             }
+            .cardRow()
         }
+        .foregroundStyle(.ink)
+        .labeledContentStyle(.perch)
         .perchScreen(sky: false)
         .navigationTitle("一次调用")
         .navigationSubtitle(Text(verbatim: row.time.map { QuotaFormat.ago($0) } ?? ""))
@@ -854,15 +934,62 @@ struct CallDetailView: View {
     @ViewBuilder
     private var resultCapsule: some View {
         let (text, color): (LocalizedStringKey, Color) = switch outcome {
-        case .ok: ("成功", .green)
-        case .failed: ("失败", .red)
-        case .refused: ("被拒", .orange)
+        case .ok: ("成功", .good)
+        case .failed: ("失败", .bad)
+        case .refused: ("被拒", .warn)
         }
-        Text(text)
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(color)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(color.opacity(0.14), in: .capsule)
+        Chip(text: text, color: color)
+    }
+}
+
+// MARK: - Loading
+
+/// Agent's skeleton in its real layout: the sentence, three tiles, the
+/// chart and a few rows. Shown after 250 ms.
+private struct AgentSkeleton: View {
+    var body: some View {
+        DelayedLoading(spoken: String(localized: "正在读取用量")) {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 10) {
+                    SkeletonBlock(height: 18)
+                    SkeletonBlock(width: 180, height: 18)
+                }
+                .padding(.horizontal, 4)
+                HStack(spacing: 8) {
+                    ForEach(0..<3, id: \.self) { _ in
+                        VStack(alignment: .leading, spacing: 8) {
+                            SkeletonBlock(width: 36, height: 10)
+                            SkeletonBlock(width: 56, height: 22, radius: 8)
+                            SkeletonBlock(height: 8)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .perchCard(radius: 18)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    SkeletonBlock(width: 90, height: 12)
+                    HStack(alignment: .bottom, spacing: 4) {
+                        ForEach(0..<14, id: \.self) { i in
+                            SkeletonBlock(height: CGFloat([18, 30, 12, 44, 26, 60, 36, 20, 52, 70, 34, 16, 40, 24][i]), radius: 3)
+                        }
+                    }
+                    .frame(height: 80, alignment: .bottom)
+                }
+                .padding(16)
+                .perchCard()
+                VStack(alignment: .leading, spacing: 16) {
+                    ForEach(0..<3, id: \.self) { _ in
+                        VStack(alignment: .leading, spacing: 6) {
+                            SkeletonBlock(width: 200, height: 14)
+                            SkeletonBlock(width: 120, height: 10)
+                        }
+                    }
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .perchCard()
+            }
+        }
     }
 }

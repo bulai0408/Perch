@@ -79,12 +79,23 @@ struct QuotaClient: Sendable {
         config.urlCache = nil
         config.httpCookieStorage = nil
         config.waitsForConnectivity = false
+        #if DEBUG
+        // PERCH_NET_DELAY_MS / PERCH_NET_FAIL / PERCH_NET_FAIL_PATHS.
+        if NetworkHook.isOn { config.protocolClasses = [NetworkHook.self] + (config.protocolClasses ?? []) }
+        #endif
         return URLSession(configuration: config)
     }()
 
+    static let cardsPath = "/v1/magpie/quotas/cards"
+
     /// `GET /v1/magpie/quotas/cards`: what magpie has kept, no vendor calls.
     func cards(timeout: TimeInterval = 8) async throws(QuotaError) -> [QuotaCard] {
-        try await send(method: "GET", path: "/v1/magpie/quotas/cards", query: [], timeout: timeout)
+        try await cardsWithData(timeout: timeout).value
+    }
+
+    /// The cards and magpie's raw answer (for the disk cache).
+    func cardsWithData(timeout: TimeInterval = 8) async throws(QuotaError) -> (value: [QuotaCard], data: Data) {
+        try await send(method: "GET", path: Self.cardsPath, query: [], timeout: timeout)
     }
 
     /// `POST /v1/magpie/quotas/refresh`: reads one card again (magpie
@@ -92,13 +103,13 @@ struct QuotaClient: Sendable {
     func refresh(_ card: QuotaCard) async throws(QuotaError) -> [QuotaCard] {
         var query = [URLQueryItem(name: "provider", value: card.provider)]
         if let user = card.user, !user.isEmpty { query.append(URLQueryItem(name: "user", value: user)) }
-        return try await send(method: "POST", path: "/v1/magpie/quotas/refresh", query: query, timeout: 35)
+        return try await send(method: "POST", path: "/v1/magpie/quotas/refresh", query: query, timeout: 35).value
     }
 
     /// Sends one request and decodes the answer as quota cards
     /// (`{"data":[QuotaCard…]}` or a bare array; see `QuotaDecoding.cards`).
     /// 404/405 count as unreachable: that address isn't a magpie.
-    private func send(method: String, path: String, query: [URLQueryItem], timeout: TimeInterval) async throws(QuotaError) -> [QuotaCard] {
+    private func send(method: String, path: String, query: [URLQueryItem], timeout: TimeInterval) async throws(QuotaError) -> (value: [QuotaCard], data: Data) {
         guard var parts = URLComponents(url: base, resolvingAgainstBaseURL: false) else { throw .unreachable }
         let basePath = parts.path
         parts.path = basePath + path
@@ -124,7 +135,7 @@ struct QuotaClient: Sendable {
         guard let http = response as? HTTPURLResponse else { throw .other("?") }
         switch http.statusCode {
         case 200..<300:
-            do { return try QuotaDecoding.cards(from: data) } catch { throw .other("JSON") }
+            do { return (try QuotaDecoding.cards(from: data), data) } catch { throw .other("JSON") }
         case 401: throw .unauthorized
         case 403: throw .forbidden
         case 404, 405: throw .unreachable

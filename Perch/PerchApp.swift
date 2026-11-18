@@ -15,9 +15,15 @@ struct PerchApp: App {
         // UI tests start from nothing saved.
         if ProcessInfo.processInfo.arguments.contains("-perch-reset") || ProcessInfo.processInfo.environment["PERCH_RESET"] == "1" {
             ConnectionStore().removeAll()
-            for key in [VersionStore.dismissedKey] { UserDefaults.standard.removeObject(forKey: key) }
+            SnapshotCache.shared.removeAll()
+            for key in [VersionStore.dismissedKey, QuotaSort.storageKey] { UserDefaults.standard.removeObject(forKey: key) }
         }
         #if DEBUG
+        // `PERCH_LANG=zh-Hans`: the app's language from the next launch on
+        // (for runners that can only pass environment, not -AppleLanguages).
+        if let lang = ProcessInfo.processInfo.environment["PERCH_LANG"] {
+            UserDefaults.standard.set([lang], forKey: "AppleLanguages")
+        }
         if DemoData.isOn {
             ConnectionStore().seedDemo(DemoData.computers())
         }

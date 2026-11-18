@@ -137,6 +137,22 @@ enum QuotaFormat {
         return String(localized: "\((minutes / 60).text) 小时 \(rest.text) 分钟")
     }
 
+    /// 1.5 正在进行: 「45 秒」, 「2 分 5 秒」, 「1 小时 2 分」,
+    /// ticking every second. `step` rounds down (VoiceOver hears it every 15 s).
+    static func elapsedTicking(since date: Date, now: Date = .now, step: Int = 1) -> String {
+        var seconds = max(0, Int(now.timeIntervalSince(date)))
+        if step > 1 { seconds -= seconds % step }
+        if seconds < 60 { return String(localized: "\(seconds.text) 秒") }
+        let minutes = seconds / 60
+        if minutes < 60 {
+            let rest = seconds % 60
+            return rest == 0 ? String(localized: "\(minutes.text) 分") : String(localized: "\(minutes.text) 分 \(rest.text) 秒")
+        }
+        let rest = minutes % 60
+        if rest == 0 { return String(localized: "\((minutes / 60).text) 小时") }
+        return String(localized: "\((minutes / 60).text) 小时 \(rest.text) 分")
+    }
+
     /// 「2 分钟前」 for the 「%@ 读取」 footer.
     static func ago(_ date: Date, now: Date = .now) -> String {
         let seconds = now.timeIntervalSince(date)

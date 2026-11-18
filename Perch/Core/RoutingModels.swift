@@ -26,12 +26,19 @@ struct RoutingGroup: Hashable, Sendable, Identifiable {
     /// Manual routing's chosen member. magpie keeps it after leaving
     /// Manual, so it only counts while `routing == "manual"`.
     var pick: String?
-    /// Switched off in magpie.
+    /// Switched off on the computer (magpie's `disabled`, provider.Group
+    /// .Disabled): kept on its Routing page, not offered to agents, a
+    /// request to it turned away. Perch lists it last, under 「已停用」,
+    /// read-only.
     var disabled: Bool
     /// One magpie found by itself (a model two providers serve).
     var auto: Bool
     /// What an Agent picks: `group/coder`.
     var ref: String
+    /// Deleted on the computer: magpie keeps a found group the user
+    /// removed in its list with `"hidden": true` (provider.DeleteGroup), so
+    /// ShowGroup can bring it back. Perch never shows one.
+    var hidden: Bool = false
 
     /// The routing as a `RoutingMode`.
     var mode: RoutingMode { RoutingMode(raw: routing) }
@@ -68,6 +75,16 @@ struct RoutingGroup: Hashable, Sendable, Identifiable {
         case .manual: .pick(memberID)
         default: .switchToOrder(membersWithFirst(memberID), from: mode)
         }
+    }
+}
+
+extension RoutingGroup {
+    /// What the 路由组 tab lists, from magpie's list: deleted (hidden)
+    /// groups dropped; the groups in use first and the stopped ones after
+    /// them, each in magpie's own order.
+    static func listed(_ groups: [RoutingGroup]) -> [RoutingGroup] {
+        let kept = groups.filter { !$0.hidden }
+        return kept.filter { !$0.disabled } + kept.filter(\.disabled)
     }
 }
 
@@ -212,6 +229,9 @@ struct RoutingChain: Equatable, Sendable {
     var lead: String?
     /// What follows it, separator included: 「 → m-beta → m-gamma」.
     var rest: String
+    /// Words, not model names, after the models: 「 · 另有 2 个」 (手动).
+    /// Drawn in the body font, not monospaced.
+    var note: String = ""
 
     /// Builds the chain for `group` according to its mode.
     init(_ group: RoutingGroup) {
@@ -225,7 +245,8 @@ struct RoutingChain: Equatable, Sendable {
                 ?? group.primary.map { RoutingDecoding.modelPart(of: $0.id) } ?? models.first
             lead = pick
             let others = max(0, models.count - 1)
-            rest = pick != nil && others > 0 ? String(localized: " · 另有 \(others.text) 个") : ""
+            rest = ""
+            note = pick != nil && others > 0 ? String(localized: " · 另有 \(others.text) 个") : ""
         default:
             lead = nil
             rest = models.joined(separator: " · ")
@@ -233,7 +254,7 @@ struct RoutingChain: Equatable, Sendable {
     }
 
     /// The whole chain as plain text.
-    var text: String { (lead ?? "") + rest }
+    var text: String { (lead ?? "") + rest + note }
 
     /// Each member's model name; where two members share it,
     /// their provider names instead: 「claude · copilot」.
@@ -336,7 +357,8 @@ enum RoutingDecoding {
             pick: string(g["pick"]).flatMap { $0.isEmpty ? nil : $0 },
             disabled: bool(g["disabled"]) ?? false,
             auto: bool(g["auto"]) ?? false,
-            ref: string(g["ref"]).flatMap { $0.isEmpty ? nil : $0 } ?? "group/\(id)"
+            ref: string(g["ref"]).flatMap { $0.isEmpty ? nil : $0 } ?? "group/\(id)",
+            hidden: (bool(g["hidden"]) ?? false) || (bool(g["deleted"]) ?? false)
         )
     }
 

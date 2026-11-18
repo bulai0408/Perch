@@ -12,6 +12,12 @@ struct AddressTests {
         ("HTTP://Office-Mac.tailnet.ts.net", "http://office-mac.tailnet.ts.net:3425"),
         ("https://magpie.example.ts.net", "https://magpie.example.ts.net"),
         ("http://10.0.0.2:3425/?k=abc#x", "http://10.0.0.2:3425"),
+        // magpie Settings' OpenAI address ends in /v1; Perch adds it itself.
+        ("http://192.168.1.20:3425/v1", "http://192.168.1.20:3425"),
+        ("http://192.168.1.20:3425/v1/", "http://192.168.1.20:3425"),
+        ("192.168.1.20/V1", "http://192.168.1.20:3425"),
+        ("https://box.example/magpie/v1", "https://box.example/magpie"),
+        ("http://office-mac:3425/v10", "http://office-mac:3425/v10"),
     ])
     func normalizes(raw: String, expected: String) {
         #expect(MagpieAddress.normalize(raw)?.absoluteString.lowercased() == expected.lowercased())
@@ -25,6 +31,36 @@ struct AddressTests {
     @Test func hostAndPort() throws {
         let url = try #require(MagpieAddress.normalize("192.168.1.20"))
         #expect(MagpieAddress.hostAndPort(url) == "192.168.1.20:3425")
+    }
+}
+
+/// Which 连不上 checklist the connect screen shows.
+struct TailscaleHostTests {
+    @Test(arguments: [
+        ("100.64.0.1", true),
+        ("100.127.255.254", true),
+        ("100.128.0.1", false),
+        ("100.63.255.255", false),
+        ("x.tail1234.ts.net", true),
+        ("Office-Mac.Tail1234.TS.NET", true),
+        ("office-mac", true),
+        ("192.168.1.20", false),
+        ("example.com", false),
+        ("office-mac.local", false),
+        ("[fd7a:115c:a1e0::1]", true),
+        ("fd7a:115c:a1e0:ab12::1", true),
+        ("fd7a:115c:a1e1::1", false),
+        ("fe80::1", false),
+    ])
+    func detects(host: String, expected: Bool) {
+        #expect(MagpieAddress.isTailscale(host: host) == expected)
+    }
+
+    @Test func fromATypedAddress() throws {
+        let url = try #require(MagpieAddress.normalize("http://[fd7a:115c:a1e0::1]:3425"))
+        #expect(MagpieAddress.isTailscale(host: try #require(url.host(percentEncoded: false))))
+        let lan = try #require(MagpieAddress.normalize("192.168.1.20"))
+        #expect(!MagpieAddress.isTailscale(host: try #require(lan.host(percentEncoded: false))))
     }
 }
 
@@ -446,7 +482,7 @@ struct RoutingDecodingTests {
     @Test func errorCopy() {
         #expect(RoutingError.rejected(status: 400, reason: "x").message == "没改成，一切保持原样。")
         #expect(RoutingError.unauthorized.message == "密钥对不上了，可能已在电脑上删掉。到「设置 → 电脑」重新填一把。")
-        #expect(RoutingError.notAdmin.message == "这把密钥不能改路由组。在电脑的 magpie 里，密钥菜单 → 高级 → 管理 API，选「任何电脑均可」。")
+        #expect(RoutingError.notAdmin.message == "这把密钥不能改路由组。在电脑的 magpie 里，这把密钥那一行点 ⋯ →「高级」→「管理 API」，选「任何电脑均可」。")
         #expect(RoutingError.timeout.isOffline)
         #expect(!RoutingError.notAdmin.isOffline)
     }

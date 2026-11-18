@@ -126,6 +126,12 @@ M provider add broke "url=http://127.0.0.1:$UP_BROKE/v1" key=fake models=m-broke
 M provider add limit "url=http://127.0.0.1:$UP_LIMIT/v1" key=fake models=m-limit | tail -1
 M provider add slow "url=http://127.0.0.1:$UP_SLOW/v1" key=fake models=m-slow | tail -1
 M group add "Fallback" models=broke/m-broke,alpha/m-alpha routing=order | sed -n 1,2p
+# Stopped and deleted groups: 「Retired」 is switched off, 「Gone」 deleted,
+# and alpha2 (alpha's upstream again) makes magpie find a group for m-alpha,
+# which is deleted too (magpie keeps that one in its list, "hidden").
+M provider add alpha2 "url=http://127.0.0.1:$UP_A/v1" key=fake-alpha2 models=m-alpha | tail -1 || echo "alpha2 not added: no found group to delete"
+M group add "Retired" models=alpha/m-alpha,beta/m-beta routing=order | sed -n 1,2p
+M group add "Gone" models=beta/m-beta routing=order | sed -n 1,2p
 
 echo "== 密钥"
 new_key() {
@@ -193,6 +199,33 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $ADMIN_
 echo "pinned pick alpha: HTTP $code"
 [ "$code" = 200 ]
 
+# Stop 「Retired」, delete 「Gone」 and the group magpie found (the Routing
+# page's switch and delete, through the Management API).
+post_admin() { curl -s -o "$W/admin-$1.json" -w '%{http_code}' -H "Authorization: Bearer $ADMIN_KEY" -H 'Content-Type: application/json' "$A/$1" -d "$2"; }
+echo "switch retired off: HTTP $(post_admin switch '{"id":"retired","on":false}')"
+echo "delete gone: HTTP $(post_admin delete '{"id":"gone"}')"
+FOUND_ID="$(curl -s -H "Authorization: Bearer $ADMIN_KEY" "$A" | /usr/bin/python3 -c 'import json,sys
+gs=[g for g in json.load(sys.stdin).get("groups", []) if g.get("auto") and not g.get("hidden")]
+print(gs[0]["id"] if gs else "")' || true)"
+if [ -n "$FOUND_ID" ]; then
+  echo "found group $FOUND_ID; delete it: HTTP $(post_admin delete "{\"id\":\"$FOUND_ID\"}")"
+else
+  echo "magpie found no group for m-alpha (no hidden group to check)"
+fi
+curl -s -H "Authorization: Bearer $ADMIN_KEY" "$A" > "$ART/routing-groups-stopped-deleted.json"
+/usr/bin/python3 - "$ART/routing-groups-stopped-deleted.json" "$FOUND_ID" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); found = sys.argv[2]
+gs = {g["id"]: g for g in d.get("groups", [])}
+for g in d.get("groups", []):
+    print("  group", g["id"], "disabled=%s hidden=%s auto=%s" % (g.get("disabled", False), g.get("hidden", False), g.get("auto", False)))
+assert gs.get("retired", {}).get("disabled") is True, "retired is not disabled"
+assert "gone" not in gs, "a deleted group of the user's is still listed"
+if found:
+    assert gs.get(found, {}).get("hidden") is True, "the deleted found group is not hidden"
+print("stopped/deleted shape OK: disabled=true for a stopped group; a deleted user group is gone; a deleted found group stays with hidden=true")
+PY
+
 # Perch talks to magpie like a phone: over the LAN address, not loopback.
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
 [ -n "$LAN_IP" ] || LAN_IP="$(ifconfig 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" {print $2; exit}')"
@@ -253,14 +286,15 @@ echo "claude-cli → group/fallback: HTTP $(agent_call group/fallback)"
 ( while true; do agent_call slow/m-slow >/dev/null; done ) & PIDS+=($!)
 SLOW_PID=$!
 
-/usr/bin/python3 - "$CFG_DIR/config.json" "$PHONE_ADDR" "$ADMIN_KEY" "$VIEW_KEY" "$LAN" "$AGENT_CALLS" <<'PY'
+/usr/bin/python3 - "$CFG_DIR/config.json" "$PHONE_ADDR" "$ADMIN_KEY" "$VIEW_KEY" "$LAN" "$AGENT_CALLS" "$FOUND_ID" <<'PY'
 import json, sys, os
-p, address, key, view, lan, agent = sys.argv[1:]
+p, address, key, view, lan, agent, found = sys.argv[1:]
 fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
     json.dump({"address": address, "key": key, "viewKey": view, "group": "coder",
                "member": "beta/m-beta", "memberTitle": "m-beta",
-               "lan": lan == "true", "agentCalls": agent == "true"}, f)
+               "lan": lan == "true", "agentCalls": agent == "true",
+               "disabledGroup": "retired", "deletedGroups": ["gone"] + ([found] if found else [])}, f)
 PY
 
 echo "== XCUITest"
@@ -272,10 +306,99 @@ ${XCODEBUILD:-xcodebuild} test \
   -scheme Perch \
   -destination "${PERCH_E2E_DESTINATION:-platform=iOS Simulator,name=iPhone 17}" \
   -only-testing:PerchUITests \
+  -skip-testing:PerchUITests/PerchShotsTests \
+  -skip-testing:PerchUITests/PerchE2ETests/test9a_videoSlow \
+  -skip-testing:PerchUITests/PerchE2ETests/test9b_videoBlockFailed \
+  -skip-testing:PerchUITests/PerchE2ETests/test9c_videoPageFailed \
+  -skip-testing:PerchUITests/PerchE2ETests/test9d_videoOffline \
+  -skip-testing:PerchUITests/PerchE2ETests/test9e_videoSummary \
   -resultBundlePath "$ART/E2EResults.xcresult"
 TEST_STATUS=$?
 set -e
 echo "xcodebuild test exit: $TEST_STATUS"
+
+# Slow-network recordings against this magpie (test9*): a fresh iPhone
+# Pro, one mp4 per case. The test drops <name>.start/.stop in $VID; this
+# watcher runs simctl io recordVideo between them. Calls keep landing so
+# each refresh rolls numbers to new values.
+VIDEOS="$ART/slownet-videos"
+rm -rf "$VIDEOS"; mkdir -p "$VIDEOS"
+VID="$CFG_DIR/video"; rm -rf "$VID"; mkdir -p "$VID"
+VRUNTIME="$(xcrun simctl list runtimes -j | /usr/bin/python3 -c '
+import json,sys
+rs=[r for r in json.load(sys.stdin)["runtimes"] if r.get("isAvailable") and r.get("platform","iOS")=="iOS" and "iOS" in r["name"]]
+print(rs[-1]["identifier"] if rs else "")')"
+VTYPE="$(xcrun simctl list devicetypes -j | /usr/bin/python3 -c '
+import json,sys
+ts={t["name"]:t["identifier"] for t in json.load(sys.stdin)["devicetypes"]}
+for n in ("iPhone 18 Pro","iPhone 17 Pro","iPhone 16 Pro"):
+    if n in ts: print(ts[n]); break')"
+VUDID=""
+if [ -n "$VRUNTIME" ] && [ -n "$VTYPE" ]; then
+  VUDID="$(xcrun simctl create perch-video "$VTYPE" "$VRUNTIME" 2>/dev/null || true)"
+fi
+VIDEO_STATUS=0
+if [ -n "$VUDID" ]; then
+  xcrun simctl boot "$VUDID" >/dev/null 2>&1 || true
+  xcrun simctl bootstatus "$VUDID" -b >/dev/null 2>&1 || true
+  xcrun simctl status_bar "$VUDID" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 >/dev/null 2>&1 || true
+  ( while true; do agent_call alpha/m-alpha >/dev/null; sleep 2; done ) & PIDS+=($!)
+  CALLS_PID=$!
+  (
+    REC=""
+    while true; do
+      for f in "$VID"/*.start; do
+        [ -e "$f" ] || continue
+        n="$(basename "$f" .start)"; rm -f "$f"
+        xcrun simctl io "$VUDID" recordVideo --codec h264 --force "$VIDEOS/$n.mp4" > "$VID/$n.log" 2>&1 &
+        REC=$!
+        for _ in $(seq 1 60); do grep -q "Recording started" "$VID/$n.log" 2>/dev/null && break; sleep 0.1; done
+        touch "$VID/$n.recording"
+      done
+      for f in "$VID"/*.stop; do
+        [ -e "$f" ] || continue
+        n="$(basename "$f" .stop)"; rm -f "$f"
+        if [ -n "$REC" ]; then kill -INT "$REC" 2>/dev/null || true; wait "$REC" 2>/dev/null || true; fi
+        REC=""
+        touch "$VID/$n.done"
+      done
+      sleep 0.2
+    done
+  ) & PIDS+=($!)
+  WATCH_PID=$!
+  echo "== recordings on $VUDID"
+  set +e
+  TEST_RUNNER_PERCH_E2E_CONFIG="$CFG_DIR/config.json" TEST_RUNNER_PERCH_VIDEO_DIR="$VID" xcodebuild test \
+    -project Perch.xcodeproj -scheme Perch \
+    -destination "id=$VUDID" \
+    -only-testing:PerchUITests/PerchE2ETests/test9a_videoSlow \
+    -only-testing:PerchUITests/PerchE2ETests/test9b_videoBlockFailed \
+    -only-testing:PerchUITests/PerchE2ETests/test9c_videoPageFailed \
+    -only-testing:PerchUITests/PerchE2ETests/test9d_videoOffline \
+    -only-testing:PerchUITests/PerchE2ETests/test9e_videoSummary \
+    -resultBundlePath "$W/Videos.xcresult" 2>&1 | sed -E 's/sk-magpie-[A-Za-z0-9_-]+/sk-magpie-…/g' > "$VIDEOS/recordings-log.txt"
+  VIDEO_STATUS=${PIPESTATUS[0]}
+  grep -E "Test Case .*(passed|failed)|error:|SLOWNET-VIDEO|SUMMARY-NUMBERS|Executed" "$VIDEOS/recordings-log.txt" | sort -u
+  set -e
+  echo "xcodebuild recordings exit: $VIDEO_STATUS"
+  kill "$WATCH_PID" "$CALLS_PID" 2>/dev/null || true
+  sleep 3   # let a call in flight finish before the routing checks read the upstream log
+  xcrun simctl shutdown "$VUDID" >/dev/null 2>&1 || true
+  xcrun simctl delete "$VUDID" >/dev/null 2>&1 || true
+  for v in "$VIDEOS"/*.mp4; do
+    [ -e "$v" ] || continue
+    echo "recording $(basename "$v"): $(( $(stat -f %z "$v") / 1024 )) KB"
+  done
+else
+  echo "no iPhone Pro device for the recordings"; VIDEO_STATUS=1
+fi
+# Named copies: (a) the summary, no count-up; (b) 连不上 / the banner collapsing.
+ROUND3="$ART/collapse-and-summary"; rm -rf "$ROUND3"; mkdir -p "$ROUND3"
+[ -e "$VIDEOS/5-summary.mp4" ] && cp "$VIDEOS/5-summary.mp4" "$ROUND3/a-agent-summary-no-countup.mp4"
+[ -e "$VIDEOS/4-offline.mp4" ] && cp "$VIDEOS/4-offline.mp4" "$ROUND3/b-offline-card-collapse.mp4"
+[ -e "$VIDEOS/3-page-failed.mp4" ] && cp "$VIDEOS/3-page-failed.mp4" "$ROUND3/b-banner-collapse.mp4"
+echo "summary/collapse recordings: $(ls "$ROUND3" | tr '\n' ' ')"
+[ "$VIDEO_STATUS" -eq 0 ] || echo "RECORDINGS FAILED ($VIDEO_STATUS)"
 kill "$SLOW_PID" 2>/dev/null || true
 echo "usage rows (claude): $(curl -s -H "Authorization: Bearer $ADMIN_KEY" "$G/v1/magpie/usage/requests?period=today&agent=claude&limit=20" \
   | /usr/bin/python3 -c 'import json,sys
@@ -305,6 +428,11 @@ PY
 else
   echo "(could not export attachments)"
 fi
+# Slow network (test5): its shots in their own folder too.
+SLOWNET="$ART/e2e-shots-slownet-e2e"
+rm -rf "$SLOWNET"; mkdir -p "$SLOWNET"
+for f in "$SHOTS"/6[0-9]-*.png; do [ -e "$f" ] && cp "$f" "$SLOWNET/"; done
+echo "slow-network e2e shots: $(ls "$SLOWNET" | tr '\n' ' ')"
 
 echo "== magpie side"
 read -r AFTER_MEMBERS AFTER_ROUTING < <(coder)
@@ -319,6 +447,7 @@ if [ "$TEST_STATUS" -ne 0 ]; then
   echo "magpie log tail:"; tail -20 "$W/magpie.log" | sed -E 's/sk-magpie-[A-Za-z0-9_-]+/sk-magpie-…/g'
   exit "$TEST_STATUS"
 fi
+[ "$VIDEO_STATUS" -eq 0 ] || { echo "FAIL: the slow-network recordings (test9*) failed"; exit "$VIDEO_STATUS"; }
 [ "${AFTER_MEMBERS%%,*}" = "beta/m-beta" ] || { echo "FAIL: Coder's first model is still ${AFTER_MEMBERS%%,*}"; exit 1; }
 [ "$AFTER_ROUTING" = "order" ] || { echo "FAIL: Coder routes by $AFTER_ROUTING, not order"; exit 1; }
 [ "$SERVED" = "beta" ] || { echo "FAIL: group/coder went to ${SERVED:-nobody}, not beta"; exit 1; }

@@ -125,3 +125,21 @@ struct HeroFontTests {
         #expect(PerchType.heroPercentSize(68) == 30)
     }
 }
+
+/// 正在进行's ticking time: seconds, then 分 秒, then 小时 分;
+/// `step` rounds down for VoiceOver.
+struct ElapsedTickingTests {
+    @Test func ticks() {
+        #expect(QuotaFormat.elapsedTicking(since: now.addingTimeInterval(-45), now: now) == "45 秒")
+        #expect(QuotaFormat.elapsedTicking(since: now.addingTimeInterval(-125), now: now) == "2 分 5 秒")
+        #expect(QuotaFormat.elapsedTicking(since: now.addingTimeInterval(-120), now: now) == "2 分")
+        #expect(QuotaFormat.elapsedTicking(since: now.addingTimeInterval(-3720), now: now) == "1 小时 2 分")
+        #expect(QuotaFormat.elapsedTicking(since: now.addingTimeInterval(-3600), now: now) == "1 小时")
+    }
+
+    @Test func clampsAndSteps() {
+        #expect(QuotaFormat.elapsedTicking(since: now.addingTimeInterval(30), now: now) == "0 秒")
+        #expect(QuotaFormat.elapsedTicking(since: now.addingTimeInterval(-128), now: now, step: 15) == "2 分")
+        #expect(QuotaFormat.elapsedTicking(since: now.addingTimeInterval(-44), now: now, step: 15) == "30 秒")
+    }
+}

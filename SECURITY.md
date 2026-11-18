@@ -34,4 +34,4 @@ In scope: the Perch app and the scripts in this repository, for example:
 - Perch sending a key somewhere other than the configured magpie address;
 - issues in how Perch parses responses from magpie.
 
-Out of scope: vulnerabilities in magpie itself. Please report those to the [magpie project](https://github.com/yetone/magpie). Perch talks to magpie over plain HTTP on your local network by design (see README). Running magpie on an untrusted network, or exposing it to the internet, is not a Perch vulnerability.
+Out of scope: vulnerabilities in magpie itself. Please report those to the [magpie project](https://github.com/yetone/magpie). Perch talks to magpie over plain HTTP on your local network or VPN (such as Tailscale) by design (see README). Running magpie on an untrusted network, or exposing it to the internet, is not a Perch vulnerability.

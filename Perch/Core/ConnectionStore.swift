@@ -175,6 +175,8 @@ final class ConnectionStore {
     /// the next; with none left, Perch is back at 连接 magpie.
     func remove(_ id: String) {
         secrets.delete(Self.keyAccount(id))
+        // 1.5: its saved answers go with it.
+        SnapshotCache.shared.remove(computer: id)
         computers.removeAll { $0.id == id }
         reachable[id] = nil
         if currentID == id { currentID = computers.first?.id }
@@ -189,7 +191,10 @@ final class ConnectionStore {
 
     /// `-perch-reset`: every computer and 密钥 gone.
     func removeAll() {
-        for c in computers { secrets.delete(Self.keyAccount(c.id)) }
+        for c in computers {
+            secrets.delete(Self.keyAccount(c.id))
+            SnapshotCache.shared.remove(computer: c.id)
+        }
         computers = []
         currentID = nil
         reachable = [:]
@@ -274,7 +279,16 @@ final class ConnectionStore {
         computers = defaults.data(forKey: Self.computersKey).flatMap { try? JSONDecoder().decode([Computer].self, from: $0) } ?? []
         let saved = defaults.string(forKey: Self.currentKey)
         currentID = computers.contains { $0.id == saved } ? saved : computers.first?.id
-        refreshMask()
+        // Before 1.5 a pasted `…/v1` address was kept and calls went to /v1/v1/….
+        var fixed = false
+        for i in computers.indices {
+            let address = MagpieAddress.droppingV1(computers[i].address)
+            if address != computers[i].address {
+                computers[i].address = address
+                fixed = true
+            }
+        }
+        if fixed { save() } else { refreshMask() }
     }
 
     /// Writes computers and the selection back, and refreshes `maskedKey`.

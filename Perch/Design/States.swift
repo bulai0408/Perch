@@ -131,7 +131,7 @@ struct OfflineCard: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.ink)
                 if let since {
-                    Text("下面是 \(QuotaFormat.clock(since, now: now)) 的数据，连上后自动更新。")
+                    Text("下面是 \(FreshnessText.when(since, now: now)) 的数据，连上后自动更新。")
                         .font(.footnote)
                         .foregroundStyle(.ink2)
                     Text("确认电脑开着、和手机在同一个网络。")
@@ -176,11 +176,12 @@ struct OfflineCard: View {
     }
 }
 
-/// Data under the offline card: 50 % opacity, 30 % saturation.
+/// Data under the offline card: 60 % opacity, 50 % saturation.
 extension View {
     /// Dims the view while `on`.
     func offlineDimmed(_ on: Bool) -> some View {
-        self.opacity(on ? 0.5 : 1).saturation(on ? 0.3 : 1)
+        self.opacity(on ? 0.6 : 1).saturation(on ? 0.5 : 1)
+            .animation(.easeInOut(duration: 0.4), value: on)
     }
 }
 

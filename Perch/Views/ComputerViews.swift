@@ -47,27 +47,31 @@ struct ComputerRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 15))
-                .foregroundStyle(.white)
-                .frame(width: 30, height: 30)
-                .background(Color.accentColor, in: .rect(cornerRadius: 7))
-                .accessibilityHidden(true)
+            Monogram(text: computer.name)
             VStack(alignment: .leading, spacing: 2) {
                 Text(verbatim: computer.name)
                     .font(.body)
+                    .foregroundStyle(.ink)
                     .lineLimit(1)
-                Text(verbatim: computer.address.absoluteString)
+                // No scheme; a long one wraps to a second line before
+                // `:port`, never inside the host or the port, never cut.
+                Text(MagpieAddress.wrappingText(computer.address))
                     .font(.system(size: 12).monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .foregroundStyle(.ink2)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel(Text(verbatim: MagpieAddress.shown(computer.address)))
             }
+            // The address takes the free width before the Spacer does, so
+            // `192.168.1.30:3425` stays on one line when it fits; the status
+            // keeps its full width and is never cut.
+            .layoutPriority(1)
             Spacer(minLength: 4)
             Text(verbatim: status)
                 .font(.footnote)
-                .foregroundStyle(status.hasPrefix("●") && status.contains("已连接") ? Color.green : Color.secondary)
+                .foregroundStyle(status.hasPrefix("●") && status.contains("已连接") ? Color.good : Color.ink2)
                 .lineLimit(1)
+                .fixedSize()
             if current {
                 Image(systemName: "checkmark")
                     .font(.body.weight(.semibold))

@@ -114,6 +114,7 @@ final class LiveStore {
     func poll(agent: String?, client: MagpieClient?, now: Date = .now) async {
         #if DEBUG
         if DemoData.isOn {
+            guard DemoData.state != "empty" else { state = .hidden; return }
             state = .running(model: "claude-opus-5-5", since: now.addingTimeInterval(-128), switches: 1)
             return
         }

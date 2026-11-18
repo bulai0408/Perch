@@ -3,24 +3,36 @@ import SwiftUI
 
 // MARK: - 一句话小结
 
-/// 「今天 Claude Code 调用 184 次，约 $12.40，八成是 Opus。」 and a red,
-/// tappable 「失败 3 次。」 → the call list on 只看失败.
+/// 「今天 Claude Code 调用 184 次，约 $12.40，八成是 Opus。」 in serif 22
+/// (numbers semibold), and a
+/// bad-coloured, tappable 「失败 3 次。」 → the call list on 只看失败.
 struct SummaryLine: View {
     let summary: AgentSummary
     let openFailures: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduce
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(verbatim: summary.sentence)
-                .font(.system(size: 17))
-                .lineLimit(3)
+        VStack(alignment: .leading, spacing: 6) {
+            CountingSentence(sentence: summary.sentence)
+                .font(.system(.title2, design: .serif))
+                .lineSpacing(6)
+                .foregroundStyle(.ink)
                 .fixedSize(horizontal: false, vertical: true)
+                .contentTransition(.numericText())
+                .animation(Motion.calm(reduce), value: summary.sentence)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(Text(verbatim: summary.sentence))
                 .accessibilityIdentifier("agent-summary")
             if let failures = summary.failures {
                 Button(action: openFailures) {
                     Text(verbatim: failures)
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(.red)
+                        .font(.system(.title2, design: .serif).weight(.semibold))
+                        .foregroundStyle(.bad)
+                        .contentTransition(.numericText())
+                        .animation(Motion.calm(reduce), value: failures)
+                        .frame(minHeight: 32)
+                        .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
                 .accessibilityHint(Text("只看失败"))
@@ -32,62 +44,139 @@ struct SummaryLine: View {
     }
 }
 
+/// The sentence with every number semibold. No count-up from 0;
+/// numbers on screen (or saved) roll old → new with `.numericText()` only
+/// when they change, in step with the 调用 tile (same animation, same
+/// totals), so both read the same number in every frame.
+struct CountingSentence: View {
+    let sentence: String
+
+    var body: some View {
+        var text = AttributedString()
+        var prefix = ""
+        for part in Self.parts(sentence) {
+            if part.number {
+                // 「$」 rides in the number's run so 「$28.29」 never breaks.
+                var run = AttributedString(prefix + part.text)
+                prefix = ""
+                run.font = .system(.title2, design: .serif).weight(.semibold).monospacedDigit()
+                text.append(run)
+            } else {
+                var plain = part.text
+                if plain.hasSuffix("$") {
+                    plain.removeLast()
+                    prefix = "$"
+                    // NBSP keeps 「约」 / "about" on the amount's line.
+                    if plain.hasSuffix(" ") { plain = String(plain.dropLast()) + "\u{00A0}" }
+                }
+                text.append(AttributedString(plain))
+            }
+        }
+        // Laid out as `en`: under zh-Hans, CoreText breaks Latin runs anywhere
+        // (「约 $」 / 「28.29」, even through NBSP and U+2060) and compresses
+        // 「，」 to half width. As `en` the line breaks before 「约」 and the
+        // comma keeps its full width; Chinese glyphs are unchanged (PingFang SC).
+        // With the NBSP above, 「约 $28.29」 moves to the next line as one piece.
+        text.languageIdentifier = "en"
+        return Text(text)
+    }
+
+    /// Runs of digits (with 「,」 and 「.」 inside) and the text between.
+    static func parts(_ s: String) -> [(text: String, number: Bool)] {
+        var out: [(String, Bool)] = []
+        var current = ""
+        var inNumber = false
+        let chars = Array(s)
+        for (i, c) in chars.enumerated() {
+            let digit = c.isASCII && c.isNumber
+            let joiner = (c == "," || c == ".") && inNumber && i + 1 < chars.count && chars[i + 1].isASCII && chars[i + 1].isNumber
+            let isNum = digit || joiner
+            if isNum != inNumber, !current.isEmpty {
+                out.append((current, inNumber))
+                current = ""
+            }
+            inNumber = isNum
+            current.append(c)
+        }
+        if !current.isEmpty { out.append((current, inNumber)) }
+        return out
+    }
+}
+
 // MARK: - 正在进行
 
-/// 「正在进行」: the calls magpie is serving right now.
+/// Ping dot, 「正在进行」, elapsed ticking every second, the model and
+/// 「中途换过一次」, and the accent sweep along the bottom. 「刚刚结束」 keeps
+/// the card for 30 s without the dot, the tick and the sweep.
 struct LiveCard: View {
     let state: LiveStore.State
     let now: Date
     let cards: [QuotaCard]
     let open: (UsageRow) -> Void
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var pulse = false
-
     private var running: Bool { if case .running = state { true } else { false } }
+    private var since: Date? { if case .running(_, let since, _) = state { since } else { nil } }
 
     var body: some View {
         Button {
             if case .finished(let row?, _, _, _) = state { open(row) }
         } label: {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(running ? Color.green : Color.secondary)
-                        .frame(width: 8, height: 8)
-                        .opacity(running && pulse ? 0.4 : 1)
-                    Text(running ? "正在进行" : "刚刚结束")
-                        .font(.system(size: 15, weight: .semibold))
-                    Spacer(minLength: 4)
-                    if case .running(_, let since, _) = state {
-                        Text("已经 \(QuotaFormat.elapsed(since: since, now: now))")
-                            .font(.system(size: 13).monospacedDigit())
-                            .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        PingDot(color: running ? .good : .ink2, active: running)
+                            .padding(.leading, -6)
+                        Text(running ? "正在进行" : "刚刚结束")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.ink)
+                        Spacer(minLength: 4)
+                        if let since {
+                            TimelineView(.periodic(from: since, by: 1)) { context in
+                                Text("已经 \(QuotaFormat.elapsedTicking(since: since, now: max(context.date, now)))")
+                                    .font(.system(size: 13).monospacedDigit())
+                                    .foregroundStyle(.ink2)
+                                    .contentTransition(.numericText(countsDown: false))
+                                    .animation(Motion.calm, value: context.date)
+                            }
+                        }
+                    }
+                    Text(verbatim: modelLine)
+                        .font(.subheadline.monospaced())
+                        .foregroundStyle(.ink)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let switchLine {
+                        Text(verbatim: switchLine)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.warn)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                Text(verbatim: modelLine)
-                    .font(.system(size: 14).monospaced())
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if let switchLine {
-                    Text(verbatim: switchLine)
-                        .font(.system(size: 13))
-                        .foregroundStyle(.orange)
-                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
+                SweepLine(active: running)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 12)
+                    .opacity(running ? 1 : 0)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .background(Color.card, in: .rect(cornerRadius: 18))
-            .contentShape(.rect)
+            .perchCard()
+            .contentShape(.rect(cornerRadius: 22))
         }
         .buttonStyle(.plain)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: spoken))
         .accessibilityIdentifier("agent-live")
-        .onAppear {
-            guard !reduceMotion else { return }
-            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) { pulse = true }
-        }
+    }
+
+    /// 「正在进行，claude-opus-5-5，已经 2 分 5 秒，中途换过一次」, moving on
+    /// in 15 s steps, not every second.
+    private var spoken: String {
+        var parts = [running ? String(localized: "正在进行") : String(localized: "刚刚结束"), modelLine]
+        if let since { parts.append(String(localized: "已经 \(QuotaFormat.elapsedTicking(since: since, now: now, step: 15))")) }
+        if let switchLine { parts.append(switchLine) }
+        return parts.filter { !$0.isEmpty }.joined(separator: "，")
     }
 
     /// Running: just the model (magpie doesn't say the account yet).
@@ -128,6 +217,9 @@ struct CostChart: View {
     let now: Date
 
     @State private var selected: Date?
+    @State private var risen = false
+    @State private var scrubs = 0
+    @Environment(\.accessibilityReduceMotion) private var reduce
 
     private var hourly: Bool { period == .today }
     private var unit: Calendar.Component { hourly ? .hour : .day }
@@ -143,12 +235,20 @@ struct CostChart: View {
         return series.last { $0.time <= selected && selected < $0.time.addingTimeInterval(step) }
     }
 
-    /// Bar colour: selected, future, current or past.
+    /// Non-zero bars ink 85 %, empty ones ink 18 % at 2 pt, the
+    /// current hour/day accent; while scrubbing the rest fade to 40 %.
     private func color(_ p: UsageSeriesPoint) -> Color {
-        if let picked { return p.id == picked.id ? .accentColor : Color.primary.opacity(0.4) }
-        if p.time > now { return Color(uiColor: .tertiarySystemFill) }
-        if now < p.time.addingTimeInterval(step) { return .accentColor }
-        return Color.primary.opacity(0.85)
+        if let picked { return p.id == picked.id ? .accentColor : Color.ink.opacity(0.4) }
+        if now >= p.time, now < p.time.addingTimeInterval(step) { return .accentColor }
+        if p.totals.cost <= 0 || p.time > now { return Color.ink.opacity(0.18) }
+        return Color.ink.opacity(0.85)
+    }
+
+    /// Empty bars show as a 2 pt stub, so the day still has a shape.
+    private func height(_ p: UsageSeriesPoint) -> Double {
+        let top = max(series.map(\.totals.cost).max() ?? 0, 0.0001)
+        let value = p.totals.cost > 0 ? p.totals.cost : top * 2 / 110
+        return risen ? value : 0
     }
 
     private var title: LocalizedStringKey { hourly ? "每小时的费用" : "每天的费用" }
@@ -181,31 +281,31 @@ struct CostChart: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.system(size: 13, weight: .semibold))
-                .padding(.horizontal, 4)
-                .accessibilityAddTraits(.isHeader)
+            BlockHeader(Text(title))
             VStack(alignment: .leading, spacing: 6) {
                 callout
                 Chart(series) { p in
-                    BarMark(x: .value("时间", p.time, unit: unit), y: .value("费用", p.totals.cost))
+                    BarMark(x: .value("时间", p.time, unit: unit), y: .value("费用", height(p)))
                         .foregroundStyle(color(p))
-                        .cornerRadius(2)
+                        .cornerRadius(3)
                         .annotation(position: .top, spacing: 2) {
                             if picked == nil, p.id == busiest?.id {
                                 Text(verbatim: String(format: "$%.1f", p.totals.cost))
                                     .font(.system(size: 11).monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.ink2)
+                                    .opacity(risen ? 1 : 0)
                                     .fixedSize()
                             }
                         }
                 }
                 .chartXScale(domain: start...end)
+                .chartYScale(domain: 0...max(series.map(\.totals.cost).max() ?? 0, 0.0001) * 1.18)
                 .chartYAxis(.hidden)
                 .chartXAxis {
                     AxisMarks(values: xValues) { v in
                         AxisValueLabel(centered: !hourly) {
                             Text(verbatim: xLabel(v.as(Date.self) ?? start))
+                                .foregroundStyle(Color.ink2)
                         }
                     }
                 }
@@ -216,11 +316,22 @@ struct CostChart: View {
                 .accessibilityChartDescriptor(CostDescriptor(series: series, hourly: hourly, title: axLabel, now: now))
                 .accessibilityIdentifier("agent-chart")
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .background(Color.card, in: .rect(cornerRadius: 18))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .perchCard()
             .contentShape(.rect)
             .onTapGesture { selected = nil }
+        }
+        .sensoryFeedback(Haptic.selection, trigger: picked?.id) { old, new in old != nil && new != nil && old != new }
+        // Bars rise from the baseline (0.8 s calm) on appear and again
+        // after a segment change; they appear at value under Reduce Motion.
+        .task(id: "\(period.rawValue)|\(series.count)") {
+            if reduce { risen = true; return }
+            if risen {
+                withAnimation(.easeInOut(duration: 0.25)) { risen = false }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            withAnimation(.spring(duration: 0.8, bounce: 0)) { risen = true }
         }
     }
 
@@ -230,8 +341,11 @@ struct CostChart: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(verbatim: CostBars.callout(picked, hourly: hourly, now: now))
                     .font(.system(size: 13).monospacedDigit())
+                    .foregroundStyle(.ink)
+                    .contentTransition(.numericText())
+                    .animation(Motion.settle, value: picked.id)
                 if let note = CostBars.unpricedNote(picked) {
-                    Text(verbatim: note).font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text(verbatim: note).font(.system(size: 12)).foregroundStyle(.ink2)
                 }
             }
             .accessibilityElement(children: .combine)
@@ -268,12 +382,14 @@ struct FilterChip<Label: View>: View {
     @ViewBuilder let label: () -> Label
 
     var body: some View {
+        // Chips: semibold on 12 % of their colour, radius 10.
         label()
             .font(.system(size: 14, weight: selected ? .semibold : .regular))
-            .foregroundStyle(selected ? Color.white : Color.primary)
+            .foregroundStyle(selected ? Color.accentColor : Color.ink)
             .padding(.horizontal, 12)
             .frame(height: 32)
-            .background(selected ? Color.accentColor : Color(uiColor: .tertiarySystemFill), in: .rect(cornerRadius: 16))
-            .contentShape(.rect(cornerRadius: 16))
+            .background(selected ? Color.accentColor.opacity(0.12) : Color.track, in: .rect(cornerRadius: 10, style: .continuous))
+            .contentShape(.rect(cornerRadius: 10))
+            .animation(Motion.settle, value: selected)
     }
 }
